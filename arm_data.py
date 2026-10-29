@@ -20,19 +20,6 @@ def gravity_torque(q_arm):
     q[:7] = q_arm
     return pin.computeGeneralizedGravity(_model, _data, q)[:7].copy()
 
-EE_FRAME = _model.getFrameId("robot_j2s7s300_end_effector")   # the hand
-DAMPING = 0.05   # m: keeps the speeds sane near singular poses (the expert uses 0.01-0.10)
-
-def ik_direction(q_arm, hand_to_target):
-    """7 joint speeds that move the hand along hand_to_target (robot's directions), least effort: J+ e."""
-    q = pin.neutral(_model)
-    q[:7] = q_arm
-    J = ...   # TODO 1: pin.computeFrameJacobian(_model, _data, q, EE_FRAME, pin.LOCAL_WORLD_ALIGNED),
-              #         keep only the position rows (first 3) and the arm columns (first 7)
-    # TODO 2: damped pseudoinverse times the error:  J^T (J J^T + DAMPING^2 I)^-1 e
-    #         (np.linalg.solve(A, b) computes A^-1 b; np.eye(3) is the 3x3 identity)
-    return ...
-
 def arm_phase_rows(folder, episode):
     """Indices of the rows of one saved episode where the arm is reaching (from base arrival onwards).
 

@@ -15,13 +15,20 @@ The shadow keeps its own q_des, updated from the real arm every step; the expert
 measured angles, so the shadow stays anchored to where the arm really is. Check: with the expert itself
 driving, the shadow's torques equal the expert's exactly (29 Oct: 0.0 N m difference over 20,090 steps).
 
+With --base, a learned base parks instead of the expert's wheels, so the arm practises from the base's real
+(slightly off) parkings; --init-model / --init-dagger continue from an earlier run's arm and data. Each round is
+then scored twice: fully learned (that base) and with expert parking (to check it does not regress).
+
 Example (about 1 hour):
     python dagger_arm.py --name a --rounds 3
+    python dagger_arm.py --name b --rounds 3 --base runs/dagger-novnoise-hard/r3/model.pt \
+        --init-model runs/dagger-arm-a/r5/model.pt --init-dagger runs/dagger-arm-a/r{1,2,3,4,5}-data
 """
 import argparse
 import json
 import multiprocessing as mp
 import os
+import shutil
 from pathlib import Path
 import numpy as np
 from eval_arm import ARM_DATA, run_eval
@@ -31,7 +38,7 @@ SAVE_EVERY = 10    # 100 rows per second; train_arm.py reads every 10th 1 kHz ro
 
 
 def _episode(job):
-    arm_path, scenario, folder, duration = job
+    arm_path, base_path, scenario, folder, duration = job
     import contextlib
     import torch
     torch.set_num_threads(1)
@@ -40,15 +47,20 @@ def _episode(job):
     from pipeline import read_json
     config = read_json(ROOT/"settings.json")
     config["duration_s"] = duration
-    policy = LearnedArm(*load_arm(arm_path), scenario["target"])
+    base = None
+    if base_path:
+        from eval_obstacles import load_model, LearnedBase
+        base = LearnedBase(*load_model(base_path))
+    policy = LearnedArm(*load_arm(arm_path), scenario["target"], base)
     with open(os.devnull, "w") as quiet, contextlib.redirect_stderr(quiet):
         return rollout(config, scenario, folder, policy, label_arm=True, save_every=SAVE_EVERY)
 
 
-def drive(arm_path, scenarios, out, duration, workers):
-    """The arm drives every scenario; the shadow expert labels every step. Writes a manifest like a dataset's."""
+def drive(arm_path, scenarios, out, duration, workers, base=None):
+    """The arm drives every scenario; the shadow expert labels every step. Writes a manifest like a dataset's.
+    base: a learned base model.pt parks instead of the expert's wheels."""
     out.mkdir(parents=True)
-    jobs = [(str(arm_path), s, str(out/s["id"]), duration) for s in scenarios]
+    jobs = [(str(arm_path), base, s, str(out/s["id"]), duration) for s in scenarios]
     with mp.get_context("spawn").Pool(workers) as pool:
         summaries = pool.map(_episode, jobs, chunksize=1)
     manifest = {"saved_every": SAVE_EVERY, "episodes": [{"path": s["id"], "scenario_id": s["id"], "split": "train",
@@ -75,30 +87,53 @@ def main():
     parser.add_argument("--duration", type=float, default=40.0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--base", help="learned base model.pt that parks (default: the expert's wheels)")
+    parser.add_argument("--init-model", help="round 0 = this arm model.pt (copied, not retrained)")
+    parser.add_argument("--init-dagger", nargs="*", default=[], help="earlier arm DAgger folders to keep training on")
+    parser.add_argument("--resume", action="store_true",
+                        help="continue an existing run to more --rounds (finished rounds are kept, not redone)")
     args = parser.parse_args()
     from train_arm import train
 
     root = ROOT/"runs"/f"dagger-arm-{args.name}"
-    if root.exists():
+    if root.exists() and not args.resume:
         raise FileExistsError(f"Choose a new name: {root}")
-    root.mkdir(parents=True)
+    root.mkdir(parents=True, exist_ok=True)
+    done = {r["round"]: r for r in json.loads((root/"results.json").read_text())["rounds"]} if args.resume else {}
     pool = training_pool()
     rng = np.random.default_rng(args.seed)
-    dagger_dirs, table = [], []
+    dagger_dirs, table = list(args.init_dagger), []
     for k in range(args.rounds + 1):
         if k > 0:
             per_set = args.per_round // len(pool)
-            chosen = [s for group in pool.values()
+            chosen = [s for group in pool.values()   # drawn even for finished rounds, so later draws match a fresh run
                       for s in (group[i] for i in rng.choice(len(group), size=min(per_set, len(group)), replace=False))]
-            drive(root/f"r{k-1}"/"model.pt", chosen, root/f"r{k}-data", args.duration, args.workers)
+            if k not in done:
+                drive(root/f"r{k-1}"/"model.pt", chosen, root/f"r{k}-data", args.duration, args.workers, args.base)
             dagger_dirs.append(str(root/f"r{k}-data"))
-        train(args.data, root/f"r{k}", seed=args.seed, dagger=dagger_dirs)
-        scores = run_eval(str(root/f"r{k}"/"model.pt"), None, root/f"r{k}-eval", args.workers, args.duration)
-        row = {"round": k, "dagger_folders": len(dagger_dirs), **{t["set"]: t["success"] for t in scores},
-               "success": sum(t["success"] for t in scores), "episodes": sum(t["episodes"] for t in scores)}
+        if k in done:
+            table.append(done[k])
+            continue
+        if k == 0 and args.init_model:
+            (root/"r0").mkdir()
+            shutil.copy(args.init_model, root/"r0"/"model.pt")
+            (root/"r0"/"training.json").write_text(json.dumps({"copied_from": args.init_model}, indent=1))
+        else:
+            train(args.data, root/f"r{k}", seed=args.seed, dagger=dagger_dirs)
+        model = str(root/f"r{k}"/"model.pt")
+        row = {"round": k, "dagger_folders": len(dagger_dirs)}
+        if args.base:     # fully learned first (the round is chosen on it), then expert parking
+            full = run_eval(model, args.base, root/f"r{k}-eval-full", args.workers, args.duration)
+            row.update({f"full_{t['set']}": t["success"] for t in full})
+            row["full_success"] = sum(t["success"] for t in full)
+        scores = run_eval(model, None, root/f"r{k}-eval", args.workers, args.duration)
+        row.update({**{t["set"]: t["success"] for t in scores},
+                    "success": sum(t["success"] for t in scores), "episodes": sum(t["episodes"] for t in scores)})
         table.append(row)
         print(f"ROUND {k}: {row}", flush=True)
-        (root/"results.json").write_text(json.dumps({"data": args.data, "rounds": table}, indent=1))
+        (root/"results.json").write_text(json.dumps({"data": args.data, "base": args.base or "expert wheels",
+                                                     "init_model": args.init_model, "init_dagger": args.init_dagger,
+                                                     "rounds": table}, indent=1))
 
 
 if __name__ == "__main__":

@@ -26,3 +26,4 @@ data/*
 *.blg
 *.out
 *.synctex.gz
+!weights/*.pt

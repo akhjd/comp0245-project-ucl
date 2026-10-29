@@ -12,7 +12,8 @@ grip 0.1 (course: 0.01) and reach-zone parking, unless stated.
 | `scenarios_random_v1.json` | 60/10/10 | `train_`, `validation_`, `test_` | course task, no obstacles (dataset-v3) | height 0.35-0.8 m | none | standard |
 | `scenarios_obstacles_v2.json` | 60/10/10 | `train_`, `validation_`, `test_` | main obstacle set; its 10 validation scenarios are the reference for all DAgger comparisons; **test = reserved for the final evaluation** | 0.35-0.8 m | 1-3 | standard |
 | `scenarios_obstacles_v3_extra.json` | 160 train | `trainb_` | more training variety, same settings as v2 | 0.35-0.8 m | 1-3 | standard |
-| `scenarios_obstacles_val100.json` | 100 validation | `validationc_` | fresh validation pool: 0-29 used by the robustness tests, 30-99 kept unused for later comparisons | 0.35-0.8 m | 1-3 | standard |
+| `scenarios_obstacles_val100.json` | 100 validation | `validationc_` | fresh validation pool, now fully used: 0-29 robustness tests, 30-59 arm round choice (eval_arm fresh-normal), 60-99 first fully-learned check | 0.35-0.8 m | 1-3 | standard |
+| `scenarios_obstacles_val_d.json` | 40 validation | `validationd_` | 29 Oct, seed 404: final fully-learned check of dagger-arm-b r3 (used once) | 0.35-0.8 m | 1-3 | standard |
 | `scenarios_obstacles_hard.json` | 30 validation | `validationhard_` | robustness: harder layouts never trained on | 0.35-0.8 m | 1-7 (mean 4), r 0.2-0.4 m, 3.5-5 m away | standard |
 | `scenarios_obstacles_v4_height.json` | 200 train | `trainh_` | arm data: wider target heights only | **0.2-1.1 m** | 1-3 | standard |
 | `scenarios_obstacles_v4_armstart.json` | 200 train | `traina_` | arm data: random arm start pose only | 0.35-0.8 m | 1-3 | **+-0.3 rad per joint** |
@@ -47,6 +48,10 @@ Standard arm start pose = the course's [0, 1.57, 0, 1, 0, 1, 0] rad.
 | `robust-hard-r3` | full robustness suite on the final base model (29 Oct afternoon) |
 | `arm-a` | arm model A (train_arm.py, 24 inputs, gravity + network), trained by Akhilesh on the three obst-v4 sets |
 | `arm-eval-arm-a`, `arm-eval-expert` | closed-loop arm test (eval_arm.py): expert wheels + learned arm, and the full-task expert on the same scenarios |
+| `dagger-arm-a` | arm DAgger with a shadow expert (dagger_arm.py), rounds r0-r5; `chosen.json` = r5 (84/90); starting point for dagger-arm-b |
+| `arm-eval-full`, `arm-eval-full-hybrid`, `arm-eval-full-expert` | final check on validationc_060-099: fully learned robot 23/40, expert wheels + arm r5 40/40, full-task expert 40/40 |
+| `dagger-arm-b` | arm DAgger with the LEARNED base parking (final base), from dagger-arm-a r5 + its data; r0-r3; fully learned / expert parking on the 90: 41/84, 47/76, 66/86, 77/87; `chosen.json` = r3; **`r3/model.pt` = final arm** |
+| `arm-eval-final`, `arm-eval-final-hybrid`, `arm-eval-final-expert` | final check on the new `scenarios_obstacles_val_d.json` (validationd_000-039): fully learned 37/40 (contact 0), expert wheels + arm 40/40, full-task expert 40/40 |
 | `robust-base-r2`, `robust-noise-r2` | overnight: robustness tests (results.json has the tables) |
 | `robust-fix-expert` | 29 Oct: the like-for-like expert reference (`expert_hold`: expert wheels, same fixed arm hold and 40 s as the learned models) on every test |
 | `robust-fix-delay` | 29 Oct: delay tests rerun for the four round-2 models after the delay warm-up fix (supersedes the delay rows of the two overnight runs) |

@@ -9,7 +9,9 @@ The episode ends with the course's success rule (hand within 1 cm for 0.25 s), o
 has been still for 1 s.
 
 Scenarios: the arm's held-out episodes (every 10th successful episode of each dataset, never trained on) and
-validationc_030-059 (fresh, normal heights). The test split is never used.
+validationc_030-059 (fresh, normal heights). --fresh A B picks other fresh scenarios and --no-held-out drops the
+held-out set (e.g. the final full-robot check on validationc_060-099, never used to choose anything).
+The test split is never used.
 
 Example:
     python eval_arm.py --name arm-a --arm runs/arm-a/model.pt
@@ -111,23 +113,24 @@ def _episode(job):
             "target_z_m": scenario["target"][2], "arm_start_changed": "arm_q0" in scenario}
 
 
-def scenarios():
-    """The arm's held-out episodes (labelled by dataset) and 30 fresh normal scenarios."""
+def scenarios(fresh=(30, 60), held_out=True, fresh_file="scenarios_obstacles_val100.json"):
+    """The arm's held-out episodes (labelled by dataset) and fresh normal scenarios fresh_file[fresh]."""
     sets = {}
-    for folder, file in ARM_DATA.items():
+    for folder, file in (ARM_DATA.items() if held_out else ()):
         episodes = json.loads((ROOT/"runs"/folder/"manifest.json").read_text())["episodes"]
         held_out = {e["scenario_id"] for i, e in enumerate(episodes) if i % 10 == 0 and e["success"]}
         sets[folder] = [s for s in json.loads((ROOT/file).read_text()) if s["id"] in held_out]
-    fresh = [s for s in json.loads((ROOT/"scenarios_obstacles_val100.json").read_text()) if s["split"] == "validation"]
-    sets["fresh-normal"] = fresh[30:60]
+    fresh_all = [s for s in json.loads((ROOT/fresh_file).read_text()) if s["split"] == "validation"]
+    sets["fresh-normal"] = fresh_all[slice(*fresh)]
     return sets
 
 
-def run_eval(arm, base, root, workers=4, duration=40.0, limit=0):
+def run_eval(arm, base, root, workers=4, duration=40.0, limit=0, fresh=(30, 60), held_out=True,
+             fresh_file="scenarios_obstacles_val100.json"):
     """Run every evaluation scenario with this arm (and base) into root; write results.json; return the table."""
     root.mkdir(parents=True)
     jobs, keys = [], []
-    for label, chosen in scenarios().items():
+    for label, chosen in scenarios(fresh, held_out, fresh_file).items():
         for s in chosen[:limit or None]:
             jobs.append((arm, base, s, str(root/label/s["id"]), duration))
             keys.append(label)
@@ -161,11 +164,15 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--duration", type=float, default=40.0)
     parser.add_argument("--limit", type=int, default=0, help="only the first N scenarios per set (smoke tests)")
+    parser.add_argument("--fresh", type=int, nargs=2, default=[30, 60], help="which validationc_ scenarios (from, to)")
+    parser.add_argument("--no-held-out", action="store_true", help="skip the arm's held-out episodes")
+    parser.add_argument("--fresh-file", default="scenarios_obstacles_val100.json", help="file of fresh scenarios")
     args = parser.parse_args()
     root = ROOT/"runs"/f"arm-eval-{args.name}"
     if root.exists():
         raise FileExistsError(f"Choose a new name: {root}")
-    run_eval(args.arm, args.base, root, args.workers, args.duration, args.limit)
+    run_eval(args.arm, args.base, root, args.workers, args.duration, args.limit, tuple(args.fresh),
+             not args.no_held_out, args.fresh_file)
 
 
 if __name__ == "__main__":
