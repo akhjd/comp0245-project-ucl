@@ -1,0 +1,46 @@
+"""Run the obstacle expert on a scenarios file and save one episode folder per scenario plus manifest.json.
+
+Example:
+    python collect_obstacles.py --scenarios scenarios_obstacles_v2.json --out runs/obst-v2b
+    python collect_obstacles.py --scenarios scenarios_obstacles_v2.json --out runs/obst-gui --only train_000 --gui
+"""
+import argparse
+import json
+from pathlib import Path
+from models import FEATURE_NAMES, ACTION_NAMES, SCHEMA_VERSION
+from pipeline import read_json, write_json, ROOT
+from obstacle_env import rollout, LIDAR_RAYS
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scenarios", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--only", nargs="*", help="scenario IDs to run")
+    parser.add_argument("--duration", type=float, default=70.0, help="seconds per episode")
+    parser.add_argument("--gui", action="store_true")
+    args = parser.parse_args()
+    config = read_json(ROOT/"settings.json")
+    config["duration_s"] = args.duration
+    scenarios = json.loads(Path(args.scenarios).read_text())
+    if args.only:
+        scenarios = [s for s in scenarios if s["id"] in args.only]
+    out = Path(args.out)
+    if out.exists():
+        raise FileExistsError(f"Choose a new output folder: {out}")
+    out.mkdir(parents=True)
+    manifest = {"schema_version": SCHEMA_VERSION, "feature_names": FEATURE_NAMES, "action_names": ACTION_NAMES,
+                "lidar_rays": LIDAR_RAYS, "settings": config, "scenarios_file": str(args.scenarios),
+                "scenarios": scenarios, "episodes": []}
+    for s in scenarios:
+        print(f"{s['id']} ({len(s['obstacles'])} obstacles) ...", flush=True)
+        summary = rollout(config, s, out/s["id"], gui=args.gui)
+        manifest["episodes"].append({"path": s["id"], **summary})
+        write_json(out/"manifest.json", manifest)
+        print(f"  {summary['termination']}: hand error {summary['final_error_m']:.4f} m, "
+              f"standoff error {summary['final_standoff_error_m']:.3f} m, contacts {summary['contact_steps']}, "
+              f"closest lidar {summary['min_lidar_m']:.2f} m, clearance {summary['min_clearance_m']:.2f} m, arrived at {summary['base_arrival_time_s']}", flush=True)
+    good = sum(e["success"] for e in manifest["episodes"])
+    print(f"{good}/{len(manifest['episodes'])} successful (target reached, no contact)")
+
+if __name__ == "__main__":
+    main()
