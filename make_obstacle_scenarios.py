@@ -13,7 +13,15 @@ target-to-start direction. archive/scenarios_obstacles_v1.json was made with the
 across it or an obstacle right beside the parking spot, and gaps down to HARD_GAP. Not every hard layout is
 solvable by the expert: collect expert runs and keep only the successful ones (the professor's advice).
 
+--moving-count LO HI adds that many MOVING cylinders (sample_moving_scenario); --static-count LO HI adds static ones
+beside them (0 0 = moving only, 1 3 = mixed). Each mover has "vel" [vx, vy] (m/s) and "span" (m; it turns round after
+travelling that far from its start). It starts off the route and is timed to cross the start-park line about when the
+robot gets there, so the robot has to wait or avoid it. Movers never enter the parking spot or the arm's reach line.
+These layouts are not all solvable: collect expert runs and keep the successful ones.
+
 Example:
+    python make_obstacle_scenarios.py --moving-count 2 3 --out moving_only.json --train 10 --validation 0 --test 0
+    python make_obstacle_scenarios.py --moving-count 1 2 --static-count 1 3 --out mixed.json --train 10 --validation 0 --test 0
     python make_obstacle_scenarios.py --out scenarios_obstacles_v2.json --train 60 --validation 10 --test 10 --seed 0
     python make_obstacle_scenarios.py --hard --out hard.json --train 140 --validation 0 --test 0 --prefix hard2 \
         --distance 3.5 5 --radius 0.2 0.35 --max-obstacles 8 --seed 101
@@ -142,6 +150,71 @@ def sample_hard_scenario(rng, args):
         return {"start": rnd([*start, yaw]), "target": rnd([*target_xy, z]), "park": rnd(park),
                 "obstacles": [{"xy": rnd(c), "r": round(float(r), 3)} for c, r in placed]}
 
+ROBOT_SPEED = 0.2   # m/s: rough average speed of the base, used to time when a mover should cross the route
+
+def path_points(c0, d, span, step=0.25):
+    """Points along the segment a mover sweeps: it oscillates between c0 - span*d and c0 + span*d."""
+    return c0 + np.arange(-span, span + 1e-9, step)[:, None]*d
+
+def sample_moving_scenario(rng, args):
+    """Start, target and parking spot like sample_scenario; then static obstacles (--static-count) that satisfy
+    fits(), then movers (--moving-count). A mover is placed backwards from where it should cross the start-park line:
+    it crosses at fraction f of the route when the robot is expected to be there, so its start is that crossing point
+    minus speed*time along its direction. All points of its whole sweep must stay clear of the parking spot, the
+    target and the park-target line, of the static obstacles and of the other movers' sweeps."""
+    while True:
+        start = rng.uniform(-1, 1, size=2)
+        yaw = rng.uniform(-np.pi, np.pi)
+        bearing = rng.uniform(-np.pi, np.pi)
+        ahead = np.array([np.cos(bearing), np.sin(bearing)])
+        side = np.array([-np.sin(bearing), np.cos(bearing)])
+        target_xy = start + rng.uniform(*args.distance) * ahead
+        z = rng.uniform(*args.height)
+        park = target_xy - standoff(z) * ahead
+        route = park - start
+        length = np.linalg.norm(route)
+        placed = []
+        for _ in range(rng.integers(args.static_count[0], args.static_count[1] + 1)):
+            for _ in range(100):
+                r = rng.uniform(*args.radius)
+                c = start + rng.uniform(0.1, 1.0)*route + rng.uniform(-1.0, 1.0)*side
+                if fits(c, r, start, park, target_xy, placed):
+                    placed.append((c, r))
+                    break
+        movers = []
+        for _ in range(rng.integers(args.moving_count[0], args.moving_count[1] + 1)):
+            for _ in range(100):
+                r, speed = rng.uniform(*args.radius), rng.uniform(*args.speed)
+                tilt = np.radians(rng.uniform(-30, 30))
+                d = rng.choice([-1, 1]) * (np.cos(tilt)*side + np.sin(tilt)*ahead)
+                f = rng.uniform(0.25, 0.8)
+                t_cross = max(3.0, f*length/ROBOT_SPEED + 3.0 + rng.uniform(-3, 3))   # 3 s: the first turn on the spot
+                c0 = start + f*route - d*speed*t_cross
+                span = speed*t_cross + rng.uniform(1.0, 2.5)
+                pts = path_points(c0, d, span)
+                if np.linalg.norm(c0 - start) < r + ROBOT_RADIUS + 0.45:
+                    continue
+                if np.linalg.norm(pts - park, axis=1).min() < r + ROBOT_RADIUS + 0.35:
+                    continue
+                if np.linalg.norm(pts - target_xy, axis=1).min() < r + 0.3:
+                    continue
+                if min(segment_distance(p, park, target_xy) for p in pts) < r + 0.15:
+                    continue
+                if any(np.linalg.norm(pts - c, axis=1).min() < r + rs + 0.3 for c, rs in placed):
+                    continue
+                if any(np.linalg.norm(pts[:, None] - m["pts"][None], axis=2).min() < r + m["r"] + 0.5 for m in movers):
+                    continue
+                movers.append({"xy": c0, "r": r, "vel": d*speed, "span": span, "pts": pts})
+                break
+        if len(movers) < args.moving_count[0]:
+            continue
+        rnd = lambda v: [round(float(x), 4) for x in v]
+        obstacles = [{"xy": rnd(c), "r": round(float(r), 3)} for c, r in placed]
+        obstacles += [{"xy": rnd(m["xy"]), "r": round(float(m["r"]), 3), "vel": rnd(m["vel"]),
+                       "span": round(float(m["span"]), 3)} for m in movers]
+        return {"start": rnd([*start, yaw]), "target": rnd([*target_xy, z]), "park": rnd(park),
+                "obstacles": obstacles}
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", required=True)
@@ -154,6 +227,11 @@ def main():
     parser.add_argument("--radius", type=float, nargs=2, default=[0.15, 0.3], help="obstacle radius, metres")
     parser.add_argument("--max-obstacles", type=int, default=3)
     parser.add_argument("--prefix", default="", help="added to split names in ids, e.g. 'b' -> trainb_000")
+    parser.add_argument("--moving-count", type=int, nargs=2, default=[0, 0], metavar=("LO", "HI"),
+                        help="moving obstacles per scenario, uniform in LO..HI (not 0 0 -> sample_moving_scenario)")
+    parser.add_argument("--static-count", type=int, nargs=2, default=[0, 0], metavar=("LO", "HI"),
+                        help="static obstacles per scenario with --moving-count, uniform in LO..HI")
+    parser.add_argument("--speed", type=float, nargs=2, default=[0.1, 0.3], help="mover speed, m/s")
     parser.add_argument("--hard", action="store_true", help="hard layouts on purpose (sample_hard_scenario)")
     parser.add_argument("--arm-noise", type=float, default=0.0,
                         help="random arm start pose: each joint uniform within +-this (rad) of the usual start")
@@ -165,7 +243,8 @@ def main():
     scenarios = []
     for split, count in [("train", args.train), ("validation", args.validation), ("test", args.test)]:
         for i in range(count):
-            sample = sample_hard_scenario if args.hard else sample_scenario
+            sample = sample_moving_scenario if args.moving_count[1] > 0 else \
+                     sample_hard_scenario if args.hard else sample_scenario
             scenario = {"id": f"{split}{args.prefix}_{i:03d}", "split": split, **sample(rng, args),
                         "seed": int(rng.integers(1_000_000))}
             if args.arm_noise > 0:

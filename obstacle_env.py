@@ -4,6 +4,7 @@ Builds on robot_env.Robot (unchanged) and the course arm expert. The base expert
 a memoryless "steer-around" (vortex) field, so its wheel command depends only on what it senses right now,
 never on an internal mode. It is sensor-only: lidar, own pose/velocity and the target position, exactly what
 a learned policy gets. Obstacle positions are used only to build the world and to count contacts (referee).
+Exception: RRTExpert deliberately reads the true obstacles (teacher-student learning).
 Physics change for obstacle runs only: wheel sideways grip 0.1 instead of the course's 0.01 (see ObstacleRobot).
 """
 import collections
@@ -25,6 +26,36 @@ LIDAR_HEIGHT = 0.3         # m above the base frame
 LIDAR_ANGLES = np.arange(LIDAR_RAYS) * 2*np.pi/LIDAR_RAYS
 WHEEL_SIDE_GRIP = 0.1      # sideways wheel friction factor; the course uses 0.01 (see ObstacleRobot)
 NAV_TIMEOUT = 50.0         # s: detours with stop-turn-go take longer than the course's 25 s open-ground limit
+
+WALL_HEIGHT, WALL_THICKNESS = 1.0, 0.1   # m: room walls, taller than the lidar plane
+
+def fit_to_room(scenario, half):
+    """Copy of a scenario inside a square room with walls at +-half metres ("room": [xmin, ymin, xmax, ymax]).
+    The robot's start, parking spot and the target must fit (ValueError otherwise). Obstacles that do not fit are
+    dropped. A mover keeps its start and velocity, but its sweep is cut at the walls: "sweep": [lo, hi] are the
+    signed distances from its start along its first direction at which it turns round. Returns (scenario, dropped)."""
+    lo, hi = np.array([-half, -half], dtype=float), np.array([half, half], dtype=float)
+    inside = lambda xy, m: bool(np.all(np.asarray(xy) >= lo + m) and np.all(np.asarray(xy) <= hi - m))
+    if not (inside(scenario["start"][:2], ROBOT_RADIUS + 0.05) and inside(scenario["park"], ROBOT_RADIUS + 0.05)
+            and inside(scenario["target"][:2], 0.05)):
+        raise ValueError(f"{scenario['id']}: start, parking spot or target outside a room of half-size {half}")
+    kept, dropped = [], 0
+    for o in scenario["obstacles"]:
+        if not inside(o["xy"], o["r"]):
+            dropped += 1
+            continue
+        if "vel" in o and np.any(np.asarray(o["vel"]) != 0):
+            c, d = np.asarray(o["xy"], dtype=float), np.asarray(o["vel"], dtype=float)
+            d = d/np.linalg.norm(d)
+            up, down = float(o.get("span", np.inf)), float(o.get("span", np.inf))
+            for axis in range(2):
+                if abs(d[axis]) > 1e-9:
+                    far = (hi[axis] - o["r"] - c[axis])/abs(d[axis])
+                    near = (c[axis] - lo[axis] - o["r"])/abs(d[axis])
+                    up, down = min(up, far if d[axis] > 0 else near), min(down, near if d[axis] > 0 else far)
+            o = {**o, "sweep": [-down, up]}
+        kept.append(o)
+    return {**scenario, "obstacles": kept, "room": [*lo.tolist(), *hi.tolist()]}, dropped
 
 def wrap(a):
     return (a + np.pi) % (2*np.pi) - np.pi
@@ -125,11 +156,14 @@ class SteerAround:
             w_max = max(w_max, w*into)
         return d / max(np.linalg.norm(d), 1e-9), w_max
 
-    def wheels(self, p, yaw, velocity, lidar, target):
-        """Wheel speeds [FR, FL, BL, BR] in rad/s, and whether the base is parked facing the target."""
+    def wheels(self, p, yaw, velocity, lidar, target, goal=None, speed_cap=None):
+        """Wheel speeds [FR, FL, BL, BR] in rad/s, and whether the base is parked facing the target.
+        goal: steer to this point instead of the parking spot (a waypoint of a planner, at least 0.3 m away);
+        speed_cap: upper limit (m/s) on the driving speed."""
         to_target = target[:2] - p
         r = np.linalg.norm(to_target)
-        goal = target[:2] - standoff(target[2]) * to_target / max(r, 1e-9)
+        if goal is None:
+            goal = target[:2] - standoff(target[2]) * to_target / max(r, 1e-9)
         dist = np.linalg.norm(goal - p)
         # Only forward speed needs braking before a turn; spinning on the spot shows up as sideways speed.
         moving = abs(np.cos(yaw)*velocity[0] + np.sin(yaw)*velocity[1]) > self.stopped
@@ -157,10 +191,300 @@ class SteerAround:
                 v, w = 0.0, (0.0 if moving else float(np.clip(3.0*err, -self.max_spin, self.max_spin)))
             else:
                 v = sign * np.clip(self.kp_v*dist, self.min_v, self.max_v) * np.cos(err) * (1 - 0.5*w_obs)
+                if speed_cap is not None:
+                    v = float(np.clip(v, -speed_cap, speed_cap))
                 w = float(np.clip(1.5*err, -self.max_curve, self.max_curve))
         left = (v - w*self.track/2) / self.wheel_radius
         right = (v + w*self.track/2) / self.wheel_radius
         return np.array([right, left, left, right]), arrived
+
+class RRTExpert(SteerAround):
+    """Privileged base expert: knows every obstacle's exact position, radius, velocity and turning points (no lidar)
+    and drives along a kinodynamic, time-extended RRT plan to the parking spot.
+
+    A tree node is (x, y, yaw, time). An edge is a short run of one of the base's real motions (`controls`: forward
+    arcs, spin on the spot, reverse) or a wait, so plans respect that the base cannot move sideways. Every sample of
+    every edge is checked against where each obstacle will be at that time. `connect` tries to finish from a node
+    with "turn to the goal, then drive straight", which gives short plans. The earliest arrival found wins, and
+    `shorten` then removes detours and needless waits. Waiting is only considered when something is moving.
+    The plan is kept while it stays valid, so the route does not change without a reason; it is replaced when the
+    robot strays from it or it runs out. Random numbers are seeded from the time, so runs are reproducible.
+    A plan is collision-free for the disc model and exact predictions; the real base can still slip off it.
+    Parking (last `park_handover` m) is SteerAround's."""
+    margins = (0.12, 0.04)         # m of clearance around the robot disc: tried in this order
+    horizon_extra = 25.0           # s the plan may take beyond the straight run
+    iters, iters_after_found = 1500, 200
+    shorten_iters, wait_trim = 100, 0.5   # tries at shortening a plan; s removed from a wait at a time
+    wait_choices = (1.0, 2.0, 4.0)
+    v_plan, w_plan = 0.2, 0.6      # m/s, rad/s of connect's straight run and spin (below the limits, to keep up)
+    sample_dt, edge_steps = 0.1, 5 # s between samples; samples per edge
+    max_stray = 0.3                # m from the plan's reference that triggers a new plan
+    check_every = 0.25             # s between plan checks
+    park_handover, park_exit = 0.3, 0.6
+    controls = np.array([[0.2, 0.0], [0.2, 0.25], [0.2, -0.25], [0.2, 0.5], [0.2, -0.5], [0.1, 0.5], [0.1, -0.5],
+                         [0.0, 0.6], [0.0, -0.6], [-0.1, 0.0], [-0.1, 0.4], [-0.1, -0.4]])
+
+    def __init__(self, robot):
+        self.robot = robot
+        self.waiting, self.wait_time, self.last_t, self.now = False, 0.0, None, 0.0
+        self.plan, self.next_check, self.parking, self.plans, self.plan_failures = None, 0.0, False, 0, 0
+        self.edges = self.rollouts()
+
+    def rollouts(self):
+        """Each control's motion from the origin: array (controls, edge_steps, 3) of x, y, yaw."""
+        out = np.zeros((len(self.controls), self.edge_steps, 3))
+        state = np.zeros((len(self.controls), 3))
+        for k in range(self.edge_steps):
+            state = state + self.sample_dt*np.stack([self.controls[:, 0]*np.cos(state[:, 2]),
+                                                     self.controls[:, 0]*np.sin(state[:, 2]), self.controls[:, 1]], axis=1)
+            out[:, k] = state
+        return out
+
+    def observe(self, t, p, yaw, lidar):
+        if self.waiting and self.last_t is not None:
+            self.wait_time += t - self.last_t
+        self.now, self.last_t = t, t
+
+    def load_world(self):
+        r = self.robot
+        speed = np.linalg.norm(r.obstacle_vel0, axis=1)
+        self.d0 = r.obstacle_vel0 / np.maximum(speed, 1e-9)[:, None]
+        self.start, self.radius, self.speed, self.sweep = r.obstacle_start.copy(), r.obstacle_r, speed, r.obstacle_sweep
+        self.room = r.room
+        self.s0 = np.sum((r.obstacle_xy - r.obstacle_start)*self.d0, axis=1)
+        self.dir = np.sign(np.sum(r.obstacle_vel*self.d0, axis=1))
+
+    def predict(self, ts):
+        """Obstacle centres at times ts (relative to now): (len(ts), obstacles, 2). Movers follow the same
+        back-and-forth between their sweep limits as ObstacleRobot.advance_obstacles."""
+        x = self.s0 + self.dir*self.speed*ts[:, None]
+        lo, width = self.sweep[:, 0], self.sweep[:, 1] - self.sweep[:, 0]
+        finite = np.isfinite(width) & (width > 1e-9)
+        if finite.any():
+            lo, W = np.where(finite, lo, 0.0), np.where(finite, width, 1.0)
+            y = np.mod(x - lo, 2*W)
+            x = np.where(finite, np.where(y <= W, y, 2*W - y) + lo, x)
+        return self.start + x[:, :, None]*self.d0
+
+    def clear(self, pts, ts, margin):
+        if self.room is not None:
+            keep = ROBOT_RADIUS + self.wall_margin
+            if np.any(pts < self.room[:2] + keep) or np.any(pts > self.room[2:] - keep):
+                return False
+        if len(self.radius) == 0:
+            return True
+        gaps = np.linalg.norm(pts[:, None] - self.predict(ts), axis=2)
+        need = ROBOT_RADIUS + margin + self.radius - self.slack[None]*np.clip(1 - ts[:, None]/2.0, 0, 1)
+        return bool(np.all(gaps >= need))
+
+    def connect(self, x, y, yaw, t, goal, margin):
+        """Spin to face the goal, drive straight to it: rows (t, x, y, yaw, v, w), or None if it would hit something."""
+        gap = goal - [x, y]
+        dist = np.linalg.norm(gap)
+        turn = wrap(np.arctan2(gap[1], gap[0]) - yaw)
+        n_spin, n_run = int(np.ceil(abs(turn)/self.w_plan/self.sample_dt)), int(np.ceil(dist/self.v_plan/self.sample_dt))
+        ts = t + self.sample_dt*np.arange(1, n_spin + n_run + 1)
+        frac_spin = np.arange(1, n_spin + 1)/max(n_spin, 1)
+        frac_run = np.arange(1, n_run + 1)/max(n_run, 1)
+        xs = np.concatenate([np.full(n_spin, x), x + gap[0]*frac_run])
+        ys = np.concatenate([np.full(n_spin, y), y + gap[1]*frac_run])
+        yaws = np.concatenate([yaw + turn*frac_spin, np.full(n_run, yaw + turn)])
+        if not self.clear(np.stack([xs, ys], axis=1), ts, margin):
+            return None
+        vs = np.concatenate([np.zeros(n_spin), np.full(n_run, self.v_plan)])
+        ws = np.concatenate([np.full(n_spin, np.sign(turn)*self.w_plan), np.zeros(n_run)])
+        return np.stack([ts, xs, ys, yaws, vs, ws], axis=1)
+
+    def search(self, p, yaw, goal, margin, rng):
+        """RRT from (p, yaw) at time 0. Returns (rows, reached_goal), or (None, False) if not even one edge is free."""
+        here = self.predict(np.zeros(1))[0] if len(self.radius) else np.zeros((0, 2))
+        self.slack = np.maximum(ROBOT_RADIUS + margin + self.radius + 0.02 - np.linalg.norm(here - p, axis=1), 0.0)
+        self.wall_margin = margin
+        if self.room is not None:   # never ask for more wall clearance than the start or the goal has
+            room_gap = np.minimum(np.minimum(p, goal) - self.room[:2], self.room[2:] - np.maximum(p, goal)).min()
+            self.wall_margin = float(np.clip(room_gap - ROBOT_RADIUS - 0.01, 0.0, margin))
+        direct = self.connect(*p, yaw, 0.0, goal, margin)
+        if direct is not None and not (self.speed > 0).any():
+            return direct, True
+        straight_time = np.linalg.norm(goal - p)/self.v_plan
+        horizon = straight_time + self.horizon_extra
+        nodes, parents, edges = [np.array([*p, yaw, 0.0])], [-1], [np.zeros((0, 6))]
+        best, best_tail = None, direct
+        best_t = direct[-1, 0] if direct is not None else np.inf
+        lo, hi = np.minimum(p, goal) - 2.0, np.maximum(p, goal) + 2.0
+        if self.room is not None:
+            lo, hi = np.maximum(lo, self.room[:2]), np.minimum(hi, self.room[2:])
+
+        def add(i, rows):
+            nonlocal best, best_tail, best_t
+            nodes.append(np.array([rows[-1, 1], rows[-1, 2], rows[-1, 3], rows[-1, 0]]))
+            parents.append(i)
+            edges.append(rows)
+            tail = self.connect(*nodes[-1], goal, margin)
+            if tail is not None and tail[-1, 0] < best_t:
+                best, best_tail, best_t = len(nodes) - 1, tail, tail[-1, 0]
+
+        def wait_from(i, d):
+            node = nodes[i]
+            ts = node[3] + self.sample_dt*np.arange(1, int(round(d/self.sample_dt)) + 1)
+            pts = np.tile(node[:2], (len(ts), 1))
+            if ts[-1] <= horizon and self.clear(pts, ts, margin):
+                add(i, np.column_stack([ts, pts, np.full(len(ts), node[2]), np.zeros((len(ts), 2))]))
+                return True
+            return False
+
+        movers = bool((self.speed > 0).any())
+        if movers:
+            for d in self.wait_choices:   # stage 1: waiting at the start, then going straight
+                wait_from(0, d)
+        found_at = None if not np.isfinite(best_t) else 0
+        for it in range(self.iters):
+            if found_at is None and np.isfinite(best_t):
+                found_at = it
+            if found_at is not None and it - found_at >= self.iters_after_found:
+                break
+            A = np.array(nodes)
+            if movers and rng.random() < 0.15:
+                i = int(rng.integers(len(nodes)))
+                wait_from(i, self.wait_choices[int(rng.integers(len(self.wait_choices)))])
+                continue
+            s_xy = goal if rng.random() < 0.25 else rng.uniform(lo, hi)
+            s_t = rng.uniform(0, horizon)
+            i = int(np.argmin(np.linalg.norm(A[:, :2] - s_xy, axis=1) + 0.05*np.abs(A[:, 3] - s_t)))
+            x, y, th, t = nodes[i]
+            c, si = np.cos(th), np.sin(th)
+            ex = x + c*self.edges[:, :, 0] - si*self.edges[:, :, 1]
+            ey = y + si*self.edges[:, :, 0] + c*self.edges[:, :, 1]
+            ts = t + self.sample_dt*np.arange(1, self.edge_steps + 1)
+            if ts[-1] > horizon:
+                continue
+            order = np.argsort(np.hypot(ex[:, -1] - s_xy[0], ey[:, -1] - s_xy[1]))
+            for k in order[:3]:
+                pts = np.stack([ex[k], ey[k]], axis=1)
+                if self.clear(pts, ts, margin):
+                    add(i, np.column_stack([ts, pts, th + self.edges[k, :, 2],
+                                            np.full((self.edge_steps, 2), self.controls[k])]))
+                    break
+        def chain(i):
+            parts = []
+            while i > 0:
+                parts.append(edges[i]); i = parents[i]
+            return parts[::-1]
+        if np.isfinite(best_t):
+            parts = chain(best) if best is not None else []
+            return self.shorten(np.vstack(parts + [best_tail]), p, yaw, goal, margin, rng), True
+        if len(nodes) == 1:
+            return None, False
+        # Goal not reached: keep the plan that stays safe longest, ending as close to the goal as possible
+        i = min(range(1, len(nodes)), key=lambda k: (-round(nodes[k][3], 1), np.linalg.norm(nodes[k][:2] - goal)))
+        return np.vstack(chain(i)), False
+
+    def rebuild(self, p, yaw, stops, margin):
+        """Rows for "wait, then turn and drive straight" through stops [(x, y), wait_s], or None if anything is hit."""
+        x, y, th, t, parts = p[0], p[1], yaw, 0.0, []
+        for (q, wait) in stops:
+            if wait > 0:
+                ts = t + self.sample_dt*np.arange(1, int(round(wait/self.sample_dt)) + 1)
+                pts = np.tile([x, y], (len(ts), 1))
+                if not self.clear(pts, ts, margin):
+                    return None
+                parts.append(np.column_stack([ts, pts, np.full(len(ts), th), np.zeros((len(ts), 2))]))
+                t = ts[-1]
+            if np.hypot(q[0] - x, q[1] - y) > 1e-3:
+                rows = self.connect(x, y, th, t, np.asarray(q), margin)
+                if rows is None:
+                    return None
+                parts.append(rows)
+                t, x, y, th = rows[-1, :4]
+        return np.vstack(parts) if parts else None
+
+    def shorten(self, rows, p, yaw, goal, margin, rng):
+        """Standard RRT clean-up. Reduce the plan to stops every edge, then repeatedly try to skip stops or trim a
+        wait, keeping a change only if the plan is still collision-free at its new times and arrives earlier."""
+        stops, wait = [], 0.0
+        for k, row in enumerate(rows):
+            if row[4] == 0 and row[5] == 0:
+                wait += self.sample_dt
+            elif (k + 1) % self.edge_steps == 0:
+                stops.append([row[1:3].copy(), round(wait, 1)])
+                wait = 0.0
+        stops.append([goal.copy(), round(wait, 1)])
+        best, best_t = rows, rows[-1, 0]
+        for _ in range(self.shorten_iters):
+            trial = [list(q) for q in stops]
+            waits = [k for k, q in enumerate(trial) if q[1] > 0]
+            if waits and rng.random() < 0.5:
+                k = waits[int(rng.integers(len(waits)))]
+                trial[k][1] = round(max(trial[k][1] - self.wait_trim, 0.0), 1)
+            elif len(trial) > 1:
+                i = int(rng.integers(len(trial) - 1))
+                j = int(rng.integers(i + 1, len(trial)))
+                # Skip stops i..j-1, but keep any waiting they contained until the mover check says it can go
+                trial = trial[:i] + [[trial[j][0], sum(q[1] for q in trial[i:j + 1])]] + trial[j + 1:]
+            else:
+                break
+            built = self.rebuild(p, yaw, trial, margin)
+            if built is not None and built[-1, 0] <= best_t + 1e-9:
+                stops, best, best_t = trial, built, built[-1, 0]
+        return best
+
+    def make_plan(self, p, yaw, goal):
+        self.load_world()
+        self.plans += 1
+        rng = np.random.default_rng(int(self.now*1000))
+        fallback = None
+        for margin in self.margins:
+            rows, reached = self.search(p, yaw, goal, margin, rng)
+            if reached:
+                return self.store(rows, p, yaw, goal, margin)
+            fallback = fallback or (rows, margin) if rows is not None else fallback
+        self.plan_failures += 1
+        return self.store(fallback[0], p, yaw, goal, fallback[1]) if fallback else None
+
+    def store(self, rows, p, yaw, goal, margin):
+        rows = np.vstack([[0.0, *p, yaw, 0.0, 0.0], rows]).copy()
+        rows[:, 0] += self.now
+        rows[:, 3] = np.unwrap(rows[:, 3])
+        return {"rows": rows, "goal": goal.copy(), "margin": margin}
+
+    def ref(self, t):
+        rows = self.plan["rows"]
+        i = min(int(np.searchsorted(rows[:, 0], t)), len(rows) - 1)
+        return np.array([np.interp(t, rows[:, 0], rows[:, k]) for k in (1, 2, 3)]), rows[i, 4], rows[i, 5]
+
+    def plan_ok(self, p, goal):
+        rows = self.plan["rows"]
+        if self.now >= rows[-1, 0] or np.linalg.norm(rows[-1, 1:3] - goal) > 0.3:
+            return False
+        return np.linalg.norm(self.ref(self.now)[0][:2] - p) <= self.max_stray
+
+    def wheels(self, p, yaw, velocity, lidar, target):
+        to_target = target[:2] - p
+        goal = target[:2] - standoff(target[2]) * to_target / max(np.linalg.norm(to_target), 1e-9)
+        dist = np.linalg.norm(goal - p)
+        self.parking = dist < (self.park_exit if self.parking else self.park_handover)
+        self.waiting = False
+        if self.parking:     # no lidar: the plan brought it here, and the generator keeps movers off the spot
+            return super().wheels(p, yaw, velocity, np.full(LIDAR_RAYS, LIDAR_RANGE), target)
+        if self.now >= self.next_check:
+            self.next_check = self.now + self.check_every
+            if self.plan is None or not self.plan_ok(p, goal):
+                self.plan = self.make_plan(p, yaw, goal)
+        if self.plan is None:   # nowhere safe to go right now
+            self.waiting = True
+            return np.zeros(4), False
+        pose, v_ref, w_ref = self.ref(self.now + 2*self.sample_dt)
+        err = pose[:2] - p
+        forward = np.cos(yaw)*err[0] + np.sin(yaw)*err[1]
+        left = -np.sin(yaw)*err[0] + np.cos(yaw)*err[1]
+        turn = wrap(pose[2] - yaw)
+        if v_ref == 0 and w_ref == 0 and np.hypot(forward, left) < 0.1 and abs(turn) < 0.1:
+            self.waiting = True
+            return np.zeros(4), False
+        v = float(np.clip(v_ref + 1.0*forward, -self.max_v, self.max_v))
+        w = float(np.clip(w_ref + 2.0*turn + 2.0*left*np.sign(v_ref or 1.0), -self.max_spin, self.max_spin))
+        l, r = (v - w*self.track/2)/self.wheel_radius, (v + w*self.track/2)/self.wheel_radius
+        return np.array([r, l, l, r]), False
 
 class ObstacleRobot(Robot):
     def __init__(self, config, scenario, gui=False):
@@ -173,12 +497,38 @@ class ObstacleRobot(Robot):
             if "wheel" in client.getJointInfo(self.rid, j)[1].decode():
                 client.changeDynamics(self.rid, j, anisotropicFriction=[1.0, WHEEL_SIDE_GRIP, 1.0])
         self.obstacle_ids = []
+        # Optional per-obstacle "vel" [vx, vy] (m/s) and "span" (m travelled along vel before turning round).
+        # Obstacles without "vel" stay where they are, so every existing scenario file behaves as before.
+        self.obstacle_xy = np.array([o["xy"] for o in scenario["obstacles"]], dtype=float).reshape(-1, 2)
+        self.obstacle_vel = np.array([o.get("vel", [0.0, 0.0]) for o in scenario["obstacles"]], dtype=float).reshape(-1, 2)
+        # Signed distance from the start along the first direction at which a mover turns round
+        self.obstacle_sweep = np.array([o.get("sweep", [-o.get("span", np.inf), o.get("span", np.inf)])
+                                        for o in scenario["obstacles"]], dtype=float).reshape(-1, 2)
+        self.obstacle_start = self.obstacle_xy.copy()
+        self.obstacle_r = np.array([o["r"] for o in scenario["obstacles"]], dtype=float)
+        self.obstacle_vel0 = self.obstacle_vel.copy()   # the reversal below flips obstacle_vel
+        self.has_moving_obstacles = bool(np.any(self.obstacle_vel != 0))
         for o in scenario["obstacles"]:
             col = client.createCollisionShape(p.GEOM_CYLINDER, radius=o["r"], height=OBSTACLE_HEIGHT)
             vis = client.createVisualShape(p.GEOM_CYLINDER, radius=o["r"], length=OBSTACLE_HEIGHT,
                                            rgbaColor=[0.45, 0.45, 0.5, 1])
             self.obstacle_ids.append(client.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
                 baseVisualShapeIndex=vis, basePosition=[o["xy"][0], o["xy"][1], OBSTACLE_HEIGHT/2]))
+        self.room, self.wall_ids = None, []
+        if "room" in scenario:
+            self.room = np.array(scenario["room"], dtype=float)
+            (x0, y0, x1, y1), t = self.room, WALL_THICKNESS
+            for cx, cy, hx, hy in [((x0 + x1)/2, y0 - t/2, (x1 - x0)/2 + t, t/2), ((x0 + x1)/2, y1 + t/2, (x1 - x0)/2 + t, t/2),
+                                   (x0 - t/2, (y0 + y1)/2, t/2, (y1 - y0)/2 + t), (x1 + t/2, (y0 + y1)/2, t/2, (y1 - y0)/2 + t)]:
+                # The wall itself is invisible (it still stops the robot and the lidar); only a flat line shows
+                col = client.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, WALL_HEIGHT/2])
+                self.wall_ids.append(client.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
+                    baseVisualShapeIndex=-1, basePosition=[cx, cy, WALL_HEIGHT/2]))
+                vis = client.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, 0.005], rgbaColor=[0.9, 0.2, 0.1, 1])
+                client.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=vis,
+                                       basePosition=[cx, cy, 0.005])
+            if gui:   # look at the whole room
+                client.resetDebugVisualizerCamera(float(max(x1 - x0, y1 - y0)), 30, -60, [(x0 + x1)/2, (y0 + y1)/2, 0])
         x, y, yaw = scenario["start"]
         z = client.getBasePositionAndOrientation(self.rid)[0][2]
         client.resetBasePositionAndOrientation(self.rid, [x, y, z], p.getQuaternionFromEuler([0, 0, yaw]))
@@ -191,9 +541,27 @@ class ObstacleRobot(Robot):
         if "arm_q0" in scenario:
             self.q_init = np.array(self.sim.GetMotorAngles(0))[4:11].copy()
             self.q_des = self.q_init.copy()
-        self.base_expert = SteerAround()   # sensor-only: never sees scenario["obstacles"]
+        # sensor-only either way: never sees scenario["obstacles"]
+        self.base_expert = RRTExpert(self) if scenario.get("expert") == "rrt" else SteerAround()
         self.base_params.nav_timeout = NAV_TIMEOUT
         self.arrived = False
+
+    def advance_obstacles(self, dt):
+        """Move the moving obstacles by dt along their velocity; after `span` metres they turn round.
+        SteerAround reads the lidar, never these positions; RRTExpert reads them."""
+        if not self.has_moving_obstacles:
+            return
+        self.obstacle_xy += self.obstacle_vel*dt
+        speed0 = np.linalg.norm(self.obstacle_vel0, axis=1)
+        d0 = self.obstacle_vel0 / np.maximum(speed0, 1e-9)[:, None]
+        along = np.sum((self.obstacle_xy - self.obstacle_start)*d0, axis=1)
+        heading = np.sum(self.obstacle_vel*d0, axis=1)
+        turn = ((along > self.obstacle_sweep[:, 1]) & (heading > 0)) | ((along < self.obstacle_sweep[:, 0]) & (heading < 0))
+        self.obstacle_vel[turn] *= -1
+        for k, body in enumerate(self.obstacle_ids):
+            if np.any(self.obstacle_vel[k] != 0):
+                self.client.resetBasePositionAndOrientation(
+                    body, [self.obstacle_xy[k, 0], self.obstacle_xy[k, 1], OBSTACLE_HEIGHT/2], [0, 0, 0, 1])
 
     def lidar(self, state):
         """36 distances (m, from the base centre) to the nearest obstacle in each direction; LIDAR_RANGE if none."""
@@ -209,15 +577,24 @@ class ObstacleRobot(Robot):
         state["lidar"] = self.lidar(state)
         return state
 
+    def contacts(self):
+        """Referee only: for each obstacle, whether the robot is touching it right now."""
+        return np.array([bool(self.client.getContactPoints(self.rid, o)) for o in self.obstacle_ids], dtype=bool)
+
     def touching(self):
-        return any(self.client.getContactPoints(self.rid, o) for o in self.obstacle_ids)
+        return any(self.client.getContactPoints(self.rid, o) for o in self.obstacle_ids + self.wall_ids)
+
+    def touching_wall(self):
+        return any(self.client.getContactPoints(self.rid, w) for w in self.wall_ids)
 
     def clearance(self, up_to=2.0):
         """Referee only: gap (m) between the robot's body (any link) and the nearest obstacle surface."""
-        gaps = [c[8] for o in self.obstacle_ids for c in self.client.getClosestPoints(self.rid, o, up_to)]
+        gaps = [c[8] for o in self.obstacle_ids + self.wall_ids for c in self.client.getClosestPoints(self.rid, o, up_to)]
         return float(min(gaps, default=up_to))
 
     def expert_action(self, state, elapsed):
+        if hasattr(self.base_expert, "observe"):
+            self.base_expert.observe(elapsed, state["base"][:2], state["yaw"], state["lidar"])
         if not self.arrived:
             wheel, self.arrived = self.base_expert.wheels(state["base"][:2], state["yaw"], state["x"][22:24],
                                                           state["lidar"], self.target)
@@ -267,7 +644,10 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
             robot = ObstacleRobot(config, scenario, gui)
             keys = ["observations", "lidar", "actions", "applied_actions", "raw_actions", "time_s", "ee_m",
                     "error_m", "base_m", "inference_ms", "arm_q_rad", "contact"] + (["expert_wheels"] if label_expert else []) \
-                   + (["expert_arm"] if label_arm else [])
+                   + (["expert_arm"] if label_arm else []) + (["obstacle_xy"] if robot.has_moving_obstacles else []) \
+                   + (["contact_obstacle"] if robot.has_moving_obstacles else []) \
+                   + (["waiting"] if hasattr(robot.base_expert, "waiting") else []) \
+                   + (["contact_wall"] if robot.wall_ids else [])
             shadow_q_des = robot.q_init.copy()
             pert = perturb or {}
             noisy_lidar = pert.get("lidar_noise", 0) > 0 or pert.get("lidar_dropout", 0) > 0
@@ -292,13 +672,21 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                 latency = (time.perf_counter() - start)*1000
                 action = clip_action(raw, config)
                 clipped += int(np.any(np.abs(raw - action) > 1e-10))
+                hit = robot.contacts()
                 for k, v in {"observations": state["x"], "lidar": state["lidar"], "actions": action,
                              "raw_actions": raw, "time_s": elapsed, "ee_m": state["ee"], "error_m": state["error"],
                              "base_m": state["base"], "inference_ms": latency, "arm_q_rad": state["q"][4:11],
-                             "contact": robot.touching()}.items():
+                             "contact": hit.any() or robot.touching_wall()}.items():
                     rows[k].append(np.copy(v))
                 if noisy_lidar:
                     rows["lidar_seen"].append(np.copy(seen["lidar"]))
+                if robot.has_moving_obstacles:   # ground truth for scoring a tracker; never given to a controller
+                    rows["obstacle_xy"].append(robot.obstacle_xy.copy())
+                    rows["contact_obstacle"].append(hit.copy())
+                if "contact_wall" in rows:
+                    rows["contact_wall"].append(robot.touching_wall())
+                if "waiting" in rows:
+                    rows["waiting"].append(robot.base_expert.waiting)
                 if label_expert:
                     label, parked = robot.base_expert.wheels(state["base"][:2], state["yaw"], state["x"][22:24],
                                                              state["lidar"], robot.target)
@@ -322,6 +710,7 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                     robot.client.applyExternalForce(robot.rid, -1, (pert["push_n"]*left).tolist(),
                                                     state["base"].tolist(), robot.p.WORLD_FRAME)
                 robot.step(applied)
+                robot.advance_obstacles(robot.control_dt)
                 if len(rows["time_s"]) % 10 == 0:     # every 10 ms: closest-point queries are slow
                     min_clearance = min(min_clearance, robot.clearance())
                 elapsed += robot.control_dt
@@ -351,13 +740,20 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                 "minimum_error_m": float(min(np.min(arrays["error_m"]), state["error"])),
                 "final_standoff_error_m": standoff_error, "final_facing_error_rad": facing_error,
                 "base_arrival_time_s": arrival_time,
-                "contact_steps": contact_steps, "contact_fraction": contact_steps/len(arrays["time_s"]),
+                "contact_steps": contact_steps,
+                **({"wall_contact_steps": int(arrays["contact_wall"].sum())} if robot.wall_ids else {}),
+                **({"contact_steps_per_obstacle": arrays["contact_obstacle"].sum(axis=0).tolist(),
+                    "obstacle_is_moving": [bool(np.any(v != 0)) for v in robot.obstacle_vel0]}
+                   if robot.has_moving_obstacles else {}), "contact_fraction": contact_steps/len(arrays["time_s"]),
                 "min_lidar_m": float(arrays["lidar"].min()), "min_clearance_m": min_clearance,
                 "base_path_length_m": float(np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1).sum()),
                 "clipped_action_fraction": clipped/len(arrays["time_s"]),
                 "base_nav_timeout_triggered": bool(policy is None and robot.base_timed_out),
                 "control_period_s": robot.control_dt, "samples": len(arrays["time_s"]), "perturb": pert}
             np.savez_compressed(folder/"trajectory.npz", **{k: v[::save_every] for k, v in arrays.items()})
+            if isinstance(robot.base_expert, RRTExpert):
+                summary["wait_time_s"] = robot.base_expert.wait_time
+                summary["plans"], summary["plan_failures"] = robot.base_expert.plans, robot.base_expert.plan_failures
             (folder/"summary.json").write_text(json.dumps(summary, indent=2))
             (folder/"episode.json").write_text(json.dumps({"scenario": scenario, "settings": config,
                 "source_sha256": provenance(config), "final_ee_m": state["ee"].tolist(),

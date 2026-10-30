@@ -9,7 +9,7 @@ import json
 from pathlib import Path
 from models import FEATURE_NAMES, ACTION_NAMES, SCHEMA_VERSION
 from pipeline import read_json, write_json, ROOT
-from obstacle_env import rollout, LIDAR_RAYS
+from obstacle_env import rollout, fit_to_room, LIDAR_RAYS
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -17,6 +17,9 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--only", nargs="*", help="scenario IDs to run")
     parser.add_argument("--duration", type=float, default=70.0, help="seconds per episode")
+    parser.add_argument("--room", type=float, metavar="HALF",
+                        help="square room with walls at +-HALF metres; scenarios that do not fit are skipped")
+    parser.add_argument("--rrt", action="store_true", help="use the privileged RRT expert (RRTExpert): true obstacles, no lidar")
     parser.add_argument("--gui", action="store_true")
     args = parser.parse_args()
     config = read_json(ROOT/"settings.json")
@@ -24,6 +27,20 @@ def main():
     scenarios = json.loads(Path(args.scenarios).read_text())
     if args.only:
         scenarios = [s for s in scenarios if s["id"] in args.only]
+    if args.room:
+        fitted = []
+        for s in scenarios:
+            try:
+                s, dropped = fit_to_room(s, args.room)
+            except ValueError as e:
+                print(f"skipped {e}")
+                continue
+            if dropped:
+                print(f"{s['id']}: dropped {dropped} obstacle(s) outside the room")
+            fitted.append(s)
+        scenarios = fitted
+    if args.rrt:
+        scenarios = [{**s, "expert": "rrt"} for s in scenarios]
     out = Path(args.out)
     if out.exists():
         raise FileExistsError(f"Choose a new output folder: {out}")
