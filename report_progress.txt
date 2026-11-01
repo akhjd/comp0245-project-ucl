@@ -10,7 +10,7 @@ CURRENT STATE
 - Expert: RRTExpert in obstacle_env.py, used with --rrt. Without --rrt, the old SteerAround expert runs.
 - Knows exact obstacle positions, sizes, velocities and turning points from the simulator. Uses no lidar.
 - Plans with a time-aware RRT, using moves the base can really make (arcs, spins, reverse, wait).
-- Fair results: 87/88 single target in a small room, 24/24 new floor plans with 3 dots (20 with a mover).
+- Latest fair result: 35/36 new floor plans with 3 dots. Usually collision-free, not guaranteed.
 - Also handles interior walls, furniture and several dots touched in turn.
 
 DECISIONS AND WHY
@@ -63,6 +63,23 @@ DECISIONS AND WHY
     Why: random search struggles with narrow doorways. OMPL had no documented support found for moving
     obstacles, and ready-made house datasets do not fit PyBullet simply.
 
+14. Dot order: finish the current room first, taking the closest dot within it, then go to the next room.
+    Why: chosen after GUI checks. Shortest total route left rooms early and walked past dots, which looked wrong.
+    How: each room change adds 2.5 m to an order's cost. Among orders within 10% of the best, the one with the fewest room
+    changes wins, then the one starting with the closest dot. Order is rechecked after each pick.
+    Note: this is a strong preference, not a strict rule, so a much shorter route can still leave a room first.
+    Cost: paths can be longer (fp_001: 88.2 -> 94.7 s).
+
+15. Among similar routes, prefer the one that does not cross a moving obstacle's path (2 m penalty per crossing).
+    Why: from a GUI check; the robot chose to pass a mover again when going on to another dot was about as short.
+
+16. A tight route (under about 1.34 m) is allowed if it saves more than 1.5 m; within a room always take its closest dot.
+    Why: GUI checks. The strict wide-route rule forced a 6.81 m route where 3.45 m was available.
+
+17. Keep 0.2 m from movers in plans, and move to the safest nearby place when no plan exists, instead of freezing.
+    Why: fair test found the robot frozen and pushed about 1 m by a mover (fp_021, 23 cm overlap): a plan passed a mover
+    by 5 cm, the base fell behind it, and with no valid plan left the robot stood still.
+
 RESULTS (collision-free runs that reached the target)
 Experts on the 20 development scenarios (10 moving only, 10 mixed):
   Static SteerAround                   5/20
@@ -98,12 +115,24 @@ MULTIPLE DOT TESTS (random floor plans, 3 dots each)
     + Wide routes                            24/24  68.2 s       9.27 m  1/72                    1/24
   24 new scenarios (20 with a mover):        24/24  70.1 s       9.25 m  3/72                    7/24
     All dots touched, closest gap 2.4 cm, slowest 126.6 s.
-  Single-dot random floor plans after these changes: 30/30, mean arrival 28.0 s, path 1.21 x straight.
+FINAL EXPERT TESTS (after all GUI fixes and decision 17)
+  Fair test, 36 new 3-dot floor plans (21 with a mover): 35/36 clean, 108/108 dots, mean 73.2 s, slowest 120.5 s.
+    Failure: fp_014, brief contacts with a mover (1.6 s total) in a tight spot with 102 failed plans.
+  Earlier 3-dot sets, also used for fixes: 23/24, 24/24, 24/24. Failure: fp_007, base clipped a wall for 0.7 s.
+  Single-dot floor plans: 30/30, mean arrival 27.9 s. No timeouts in any test above.
+  Single target in a 7 m x 7 m room: 86/88, mean arrival 26.3 s, slowest 42.8 s. Failures: traingmi_011 (wheel clip while
+    turning, seen before) and traingmi_001 (fingers touch a wall while reaching a target 5 cm from it, about 11.7 s).
   Best order vs nearest (before these fixes): 24/24 each, orders differed in 2/24, best 5.9 s faster in those.
   BUG, found by the user in the GUI: the first dot was not removed and a piece of furniture or a wall line was
   removed instead. Fixed. Test results were unchanged by the fix.
 
 WHAT WE FOUND OUT
+- User saw the robot circle a dot though it could reach it directly. Causes: only 4 straight-line closest spots were
+  compared (some behind walls), and it had to reach its chosen spot exactly. Changes: compare all valid spots, and stop
+  once within 0.2 m of reach distance with a clear line. On fp_022 and fp_011: arc around the dot 83-105 -> 20 deg or less.
+- User GUI checks: odd dot order (cases 1, 5) and left-right shaking (cases 2, 3). Order chose the shortest total even by
+  0.01 m and walked past dots. Shaking came from parking while facing away, near the start. Changes: room-change penalty
+  (finish a room first), prefer the closest dot among near-equal orders, own parking turn. Fair test: 24/24.
 - User saw an unnecessary turn-back in fp_005. Cause: A* accepted tight routes (down to 1.1 m) where the arm could not
   swing round, so RRT backed out and clipped furniture. Change: prefer routes with room to turn (0.67 m clearance, still
   fits 1.4 m doorways). On fp_005: no turn-back, contacts 233 -> 0, clearance 0 -> 20.7 cm. Retest: 24/24 clean.
@@ -135,7 +164,9 @@ KNOWN PROBLEMS
 - The base can slide off its plan during turns and clip something close by (1 run in 88). Not fixed.
 - Paths are still about 1.3-1.5 times the straight-line distance. Slowest run parks in 40-50 s.
 - Plan quality varies a lot by chance: small code changes moved single static runs by up to 15 s either way.
-- Some direction reversals remain with movers (7 of 24 runs). Not yet checked whether they are needed.
+- Some direction reversals remain (5 of 24 new runs). Not checked whether they are needed.
+- Tight spots near movers can still cause brief contact (fp_014), and the base can clip walls (fp_007).
+- The arm's reach is not collision-checked: targets very near a wall can make the fingers touch it (traingmi_001).
 - Only tested with obstacle radius 0.15-0.30 m and mover speed 0.10-0.30 m/s.
 - The arm circles assume the usual arm start pose (not arm_q0 scenarios).
 - The arm's reach after parking and the last 0.3 m of parking are not checked against obstacles.

@@ -15,6 +15,7 @@ import json
 import time
 from pathlib import Path
 import numpy as np
+from scipy import ndimage
 from models import clip_action
 from reach_zone import parking_distance
 from robot_env import Robot, provenance
@@ -28,6 +29,9 @@ LIDAR_HEIGHT = 0.3         # m above the base frame
 LIDAR_ANGLES = np.arange(LIDAR_RAYS) * 2*np.pi/LIDAR_RAYS
 WHEEL_SIDE_GRIP = 0.1      # sideways wheel friction factor; the course uses 0.01 (see ObstacleRobot)
 NAV_TIMEOUT = 50.0         # s: detours with stop-turn-go take longer than the course's 25 s open-ground limit
+REACH_BAND = 0.2   # m: within this of the reach distance, the base may stop and creep instead of going to its chosen spot
+MOVER_CROSS_COST = 2.0   # m added to a leg whose route crosses a mover's sweep
+ROOM_CHANGE_COST, ORDER_TIE = 2.5, 0.1     # m added per room change when ordering dots; share of the best cost counted as a tie
 RETRACT_RATE, RETRACT_SETTLED = 0.5, 0.05   # rad/s: speed of the arm's return between dots; joint speed counted as stopped
 RRT_NAV_TIMEOUT = 90.0     # s: RRTExpert also waits for movers, so its routes can take longer
 
@@ -69,10 +73,11 @@ def box_gaps(points, lo, hi):
 class FloorPlanRoute:
     """A* on a grid over the room, around walls, furniture and static cylinders, to guide RRTExpert between rooms.
     RRT alone rarely finds a doorway; here it only has to reach the farthest route point it can see. Movers are
-    left to RRT. A route with room to turn (`wide`, which still fits a 1.4 m doorway) is preferred over a shorter one
-    through a tight gap, where the arm cannot swing round; `narrow` is used only if there is no wide route."""
+    left to RRT. A route with room to turn (`wide`, which still fits a 1.4 m doorway) is preferred over one through a
+    tight gap, where the arm cannot swing round, unless the tight route saves more than `tight_cost` metres."""
     cell = 0.1            # m
     wide, narrow = ROBOT_RADIUS + 0.2, ROBOT_RADIUS + 0.08   # m kept from anything
+    tight_cost = 1.5      # m a tight route must save to be chosen
     blocked_start = 0.35  # m of a line from an already tight spot that may be in the kept-clear zone
 
     def __init__(self, room, lo, hi, centres, radii):
@@ -88,6 +93,20 @@ class FloorPlanRoute:
             gap = np.minimum(gap, np.linalg.norm(grid - c, axis=-1) - r)
         self.gap = gap
         self.free = gap >= self.wide
+        self.field_key, self.field = None, None
+        self.grid = grid
+
+    def set_rooms(self, wall_lo, wall_hi):
+        """Number the rooms: the areas left when the walls are thickened enough to close the 1.4 m doorways."""
+        open_area = box_gaps(self.grid, wall_lo, wall_hi).min(axis=-1) > 0.75 if len(wall_lo) else np.ones(self.gap.shape, dtype=bool)
+        self.rooms, _ = ndimage.label(open_area)
+
+    def room_of(self, p):
+        cell = np.array(self.to_cell(p))
+        idx = np.argwhere(self.rooms > 0)
+        if len(idx) == 0:
+            return 0
+        return int(self.rooms[tuple(idx[np.argmin(np.sum((idx - cell)**2, axis=1))])])
 
     def to_cell(self, p):
         return tuple(np.clip(np.round((np.asarray(p) - self.origin)/self.cell).astype(int), 0, np.array(self.free.shape) - 1))
@@ -109,12 +128,44 @@ class FloorPlanRoute:
 
     def path(self, start, goal):
         """Route points from start to goal (world coordinates), or None if there is no route."""
+        length = lambda pts: float(np.sum(np.linalg.norm(np.diff(np.vstack([start, *pts]), axis=0), axis=1)))
+        self.free = self.gap >= self.narrow
+        tight = self.search(start, goal)
         self.free = self.gap >= self.wide
         pts = self.search(start, goal)
-        if pts is None:
+        if tight is not None and (pts is None or length(tight) + self.tight_cost < length(pts)):
             self.free = self.gap >= self.narrow
-            pts = self.search(start, goal)
+            return tight
         return pts
+
+    def lengths_from(self, start):
+        """Shortest route length (m) from start to every grid cell, with the same preference as path()."""
+        key = tuple(np.round(start, 2))
+        if self.field_key != key:
+            self.field_key = key
+            self.field = np.minimum(self.flood(start, self.gap >= self.wide), self.flood(start, self.gap >= self.narrow) + self.tight_cost)
+        return self.field
+
+    def flood(self, start, free):
+        self.free = free
+        a = self.nearest_free(self.to_cell(start))
+        dist = np.full(free.shape, np.inf)
+        if a is None:
+            return dist
+        dist[a] = 0.0
+        heap = [(0.0, a)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if d > dist[u]:
+                continue
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                v = (u[0] + dx, u[1] + dy)
+                if 0 <= v[0] < free.shape[0] and 0 <= v[1] < free.shape[1] and free[v]:
+                    c = d + self.cell*np.hypot(dx, dy)
+                    if c < dist[v]:
+                        dist[v] = c
+                        heapq.heappush(heap, (c, v))
+        return dist
 
     def search(self, start, goal):
         a, b = self.nearest_free(self.to_cell(start)), self.nearest_free(self.to_cell(goal))
@@ -316,6 +367,9 @@ class RRTExpert(SteerAround):
     wait_choices = (1.0, 2.0, 4.0)
     v_plan, w_plan = 0.2, 0.6      # m/s, rad/s of connect's straight run and spin (below the limits, to keep up)
     sample_dt, edge_steps = 0.1, 5 # s between samples; samples per edge
+    mover_margin = 0.2             # m kept from movers in plans, more than from static things
+    mover_alarm = 0.05             # m: a real gap to a mover below this ends the current plan
+    escape_time = 1.5              # s looked ahead when moving away without a plan
     max_stray = 0.3                # m from the plan's reference that triggers a new plan
     check_every = 0.25             # s between plan checks
     park_handover, park_exit = 0.3, 0.6
@@ -327,6 +381,7 @@ class RRTExpert(SteerAround):
         self.robot = robot
         self.waiting, self.wait_time, self.last_t, self.now = False, 0.0, None, 0.0
         self.plan, self.next_check, self.parking, self.plans, self.plan_failures = None, 0.0, False, 0, 0
+        self.spin_dir, self.can_reach, self.next_reach_check, self.escape_motion = 0, False, 0.0, (0.0, 0.0)
         self.edges = self.rollouts()
 
     def rollouts(self):
@@ -389,10 +444,55 @@ class RRTExpert(SteerAround):
             return True
         centres = self.predict(ts)
         gaps = np.linalg.norm(pts[:, None] - centres, axis=2)
-        if np.any(gaps < ROBOT_RADIUS + margin + self.radius - self.slack[None]*fade):
+        keep = self.obstacle_margin(margin)
+        if np.any(gaps < ROBOT_RADIUS + keep + self.radius - self.slack[None]*fade):
             return False
         arm_gaps = np.linalg.norm(arm[:, :, None] - centres[:, None], axis=3).min(axis=1)
-        return bool(np.all(arm_gaps >= self.arm_r + margin + self.radius - self.slack_arm[None]*fade))
+        return bool(np.all(arm_gaps >= self.arm_r + keep + self.radius - self.slack_arm[None]*fade))
+
+    def obstacle_margin(self, margin):
+        """Clearance per obstacle: a mover always gets at least `mover_margin`, as the base runs a little behind plan."""
+        return np.where(self.speed > 0, max(margin, self.mover_margin), margin)
+
+    def mover_too_close(self, p, yaw):
+        """Measured from the robot's real pose: is a mover within `mover_alarm` of the base or the arm right now?"""
+        self.load_world()
+        moving = self.speed > 0
+        if not moving.any():
+            return False
+        here = self.predict(np.zeros(1))[0][moving]
+        arm = self.arm_points(p[None], np.array([yaw]))[0]
+        return bool(np.any(np.linalg.norm(here - p, axis=1) < ROBOT_RADIUS + self.radius[moving] + self.mover_alarm)
+                    or np.any(np.linalg.norm(arm[:, None] - here[None], axis=2).min(axis=0) < self.arm_r + self.radius[moving] + self.mover_alarm))
+
+    def safest_motion(self, p, yaw):
+        """With no plan, do not freeze in a mover's way: of the base's motions and standing still, take the one that
+        keeps the largest predicted gap to everything over the next `escape_time` seconds. Returns (v, w)."""
+        self.load_world()
+        ts = np.arange(1, int(self.escape_time/self.sample_dt) + 1)*self.sample_dt
+        best, best_gap = (0.0, 0.0), -np.inf
+        for v, w in [(0.0, 0.0), *self.controls.tolist(), (-0.2, 0.0), (0.25, 0.0)]:
+            th = yaw + w*ts
+            if abs(w) > 1e-9:
+                xs = p[0] + v/w*(np.sin(th) - np.sin(yaw))
+                ys = p[1] - v/w*(np.cos(th) - np.cos(yaw))
+            else:
+                xs, ys = p[0] + v*ts*np.cos(yaw), p[1] + v*ts*np.sin(yaw)
+            pts = np.stack([xs, ys], axis=1)
+            arm = self.arm_points(pts, th)
+            gaps = [np.inf]
+            if self.room is not None:
+                gaps += [np.minimum(pts - self.room[:2], self.room[2:] - pts).min() - ROBOT_RADIUS,
+                         np.minimum(arm - self.room[:2], self.room[2:] - arm).min() - self.arm_r]
+            if len(self.box_lo):
+                gaps += [box_gaps(pts, self.box_lo, self.box_hi).min() - ROBOT_RADIUS, box_gaps(arm, self.box_lo, self.box_hi).min() - self.arm_r]
+            if len(self.radius):
+                centres = self.predict(ts)
+                gaps += [(np.linalg.norm(pts[:, None] - centres, axis=2) - self.radius).min() - ROBOT_RADIUS,
+                         (np.linalg.norm(arm[:, :, None] - centres[:, None], axis=3) - self.radius).min() - self.arm_r]
+            if min(gaps) > best_gap + 1e-3:
+                best, best_gap = (v, w), min(gaps)
+        return best
 
     def connect(self, x, y, yaw, t, goal, margin):
         """Spin to face the goal, drive straight to it: rows (t, x, y, yaw, v, w), or None if it would hit something."""
@@ -415,10 +515,11 @@ class RRTExpert(SteerAround):
     def search(self, p, yaw, goal, margin, rng):
         """RRT from (p, yaw) at time 0. Returns (rows, reached_goal), or (None, False) if not even one edge is free."""
         here = self.predict(np.zeros(1))[0] if len(self.radius) else np.zeros((0, 2))
-        self.slack = np.maximum(ROBOT_RADIUS + margin + self.radius + 0.02 - np.linalg.norm(here - p, axis=1), 0.0)
+        keep = self.obstacle_margin(margin)
+        self.slack = np.maximum(ROBOT_RADIUS + keep + self.radius + 0.02 - np.linalg.norm(here - p, axis=1), 0.0)
         arm_now = self.arm_points(p[None], np.array([yaw]))[0]
         arm_gap = np.linalg.norm(arm_now[:, None] - here[None], axis=2).min(axis=0) if len(self.radius) else np.zeros(0)
-        self.slack_arm = np.maximum(self.arm_r + margin + self.radius + 0.02 - arm_gap, 0.0)
+        self.slack_arm = np.maximum(self.arm_r + keep + self.radius + 0.02 - arm_gap, 0.0)
         if len(self.box_lo):
             self.slack_box = np.maximum(ROBOT_RADIUS + margin + 0.02 - box_gaps(p, self.box_lo, self.box_hi), 0.0)
             self.slack_box_arm = np.maximum(self.arm_r + margin + 0.02 - box_gaps(arm_now, self.box_lo, self.box_hi).min(axis=0), 0.0)
@@ -560,8 +661,35 @@ class RRTExpert(SteerAround):
                 rows = trial
         return rows[1:]
 
+    def park(self, p, yaw, velocity, target):
+        """Turn to face the target, keeping one turning direction until roughly facing it, then creep to the reach
+        distance. Starting a turn from close by (or facing away) does not hunt left and right."""
+        to_target = target[:2] - p
+        err = wrap(np.arctan2(to_target[1], to_target[0]) - yaw)
+        radial = np.linalg.norm(to_target) - standoff(target[2])
+        moving = abs(np.cos(yaw)*velocity[0] + np.sin(yaw)*velocity[1]) > self.stopped
+        if abs(err) < 0.1:
+            self.spin_dir = 0
+        elif self.spin_dir == 0 and abs(err) > 0.3:
+            self.spin_dir = np.sign(err)
+        v, w, arrived = 0.0, 0.0, False
+        if self.spin_dir != 0:
+            if not moving:
+                w = self.spin_dir*float(np.clip(3.0*abs(err), 0.2, self.max_spin))
+        elif abs(radial) > self.park_tol:
+            v = float(np.clip(self.kp_v*radial, -self.creep_v, self.creep_v))
+            w = float(np.clip(3.0*err, -self.max_curve, self.max_curve))
+        elif abs(err) > self.ang_tol:
+            if not moving:
+                w = float(np.clip(3.0*err, -self.max_spin, self.max_spin))
+        else:
+            arrived = not moving
+        l, r = (v - w*self.track/2)/self.wheel_radius, (v + w*self.track/2)/self.wheel_radius
+        return np.array([r, l, l, r]), arrived
+
     def reset_for_next_dot(self):
-        self.plan, self.parking, self.next_check = None, False, self.now
+        self.plan, self.parking, self.next_check, self.spin_dir = None, False, self.now, 0
+        self.can_reach, self.next_reach_check = False, self.now
 
     def make_plan(self, p, yaw, goal):
         """Best of `searches` RRT runs with different fixed seeds: the earliest arrival, at the largest margin that
@@ -597,8 +725,10 @@ class RRTExpert(SteerAround):
         i = min(int(np.searchsorted(rows[:, 0], t)), len(rows) - 1)
         return np.array([np.interp(t, rows[:, 0], rows[:, k]) for k in (1, 2, 3)]), rows[i, 4], rows[i, 5]
 
-    def plan_ok(self, p, goal):
+    def plan_ok(self, p, yaw, goal):
         rows = self.plan["rows"]
+        if self.mover_too_close(p, yaw):
+            return False
         if self.now >= rows[-1, 0] or np.linalg.norm(rows[-1, 1:3] - goal) > 0.3:
             return False
         return np.linalg.norm(self.ref(self.now)[0][:2] - p) <= self.max_stray
@@ -609,22 +739,30 @@ class RRTExpert(SteerAround):
         if self.robot.fixed_park is not None:   # in a floor plan the line to the target may cross a wall
             goal = self.robot.fixed_park
         dist = np.linalg.norm(goal - p)
-        self.parking = dist < (self.park_exit if self.parking else self.park_handover)
+        if self.robot.choose_spot and self.now >= self.next_reach_check:
+            self.next_reach_check = self.now + self.check_every
+            self.can_reach = self.robot.can_reach_from(p, yaw)
+        self.parking = dist < (self.park_exit if self.parking else self.park_handover) or self.can_reach \
+            or (self.parking and abs(np.linalg.norm(to_target) - standoff(target[2])) < 2*REACH_BAND)
         self.waiting = False
-        if self.parking:     # no lidar: the plan brought it here, and the generator keeps movers off the spot
-            return super().wheels(p, yaw, velocity, np.full(LIDAR_RAYS, LIDAR_RANGE), target)
+        if self.parking:     # the plan brought it here, and spots are chosen away from movers and furniture
+            return self.park(p, yaw, velocity, target)
         if self.now >= self.next_check:
             self.next_check = self.now + self.check_every
-            if self.plan is None or not self.plan_ok(p, self.plan["goal"] if self.plan["via"] else goal) \
+            if self.plan is None or not self.plan_ok(p, yaw, self.plan["goal"] if self.plan["via"] else goal) \
                     or (self.plan["via"] and np.linalg.norm(self.plan["goal"] - p) < self.via_reached):
                 route = self.robot.route
                 sub = route.subgoal(p, goal) if route is not None else goal
                 self.plan = self.make_plan(p, yaw, sub)
                 if self.plan is not None:
                     self.plan["via"] = bool(np.linalg.norm(sub - goal) > 1e-6)
-        if self.plan is None:   # nowhere safe to go right now
-            self.waiting = True
-            return np.zeros(4), False
+                else:
+                    self.escape_motion = self.safest_motion(p, yaw)
+        if self.plan is None:   # no plan right now: move to the safest nearby place until there is one
+            v, w = self.escape_motion
+            l, r = (v - w*self.track/2)/self.wheel_radius, (v + w*self.track/2)/self.wheel_radius
+            self.waiting = v == 0 and w == 0
+            return np.array([r, l, l, r]), False
         pose, v_ref, w_ref = self.ref(self.now + 2*self.sample_dt)
         err = pose[:2] - p
         forward = np.cos(yaw)*err[0] + np.sin(yaw)*err[1]
@@ -712,6 +850,9 @@ class ObstacleRobot(Robot):
             static = [o for o in scenario["obstacles"] if "vel" not in o]
             self.route = FloorPlanRoute(self.room, self.box_lo, self.box_hi, [np.array(o["xy"]) for o in static],
                                         [o["r"] for o in static])
+            walls = [b for b in boxes if b.get("kind") != "furniture"]
+            self.route.set_rooms(np.array([b["min"] for b in walls], dtype=float).reshape(-1, 2),
+                                 np.array([b["max"] for b in walls], dtype=float).reshape(-1, 2))
         # Several dots: scenario["targets"] and, in floor plans, scenario["parks"]. The hand touches a dot (the usual
         # success rule), the dot disappears, the arm returns to its driving pose, and the base goes to the next one.
         self.dots = [np.asarray(t, dtype=float) for t in scenario.get("targets", [scenario["target"]])]
@@ -743,52 +884,75 @@ class ObstacleRobot(Robot):
         self.arrived = False
         self.choose_dot(np.array([x, y]))
 
+    def spot_ok(self, spot, k, room=0.2):
+        """Can the base stand at `spot` to reach dot k? Room for the base (`room` m of margin), a clear line for the arm,
+        away from static obstacles and from the whole sweep of every mover."""
+        tg = self.dots[k]
+        line = spot + np.linspace(0, 1, 8)[:, None]*(tg[:2] - spot)
+        if self.room is not None and (np.any(spot < self.room[:2] + ROBOT_RADIUS + room) or np.any(spot > self.room[2:] - ROBOT_RADIUS - room)):
+            return False
+        if len(self.box_lo) and (box_gaps(spot, self.box_lo, self.box_hi).min() < ROBOT_RADIUS + room
+                                 or box_gaps(line, self.box_lo, self.box_hi).min() < 0.2):
+            return False
+        for c, r, d, (lo, hi) in zip(self.obstacle_start, self.obstacle_r, self.obstacle_vel0, self.obstacle_sweep):
+            moving = np.any(d != 0)
+            along = np.linspace(max(lo, -9), min(hi, 9), 60) if moving else np.zeros(1)
+            path = c + along[:, None]*(d/max(np.linalg.norm(d), 1e-9))
+            if np.linalg.norm(path - spot, axis=1).min() < r + ROBOT_RADIUS + (0.35 if moving else room) \
+                    or np.linalg.norm(path[:, None] - line[None], axis=2).min() < r + 0.15:
+                return False
+        return True
+
     def spots(self, k):
-        """Valid parking spots of dot k: points at reach distance from it, on any side, with room for the base and a
-        clear line for the arm, away from static obstacles and from the whole sweep of every mover."""
-        tg, out = self.dots[k], []
-        for angle in np.arange(0, 2*np.pi, np.pi/18):
-            spot = tg[:2] - standoff(tg[2])*np.array([np.cos(angle), np.sin(angle)])
-            line = spot + np.linspace(0, 1, 8)[:, None]*(tg[:2] - spot)
-            if self.room is not None and (np.any(spot < self.room[:2] + ROBOT_RADIUS + 0.2) or np.any(spot > self.room[2:] - ROBOT_RADIUS - 0.2)):
-                continue
-            if len(self.box_lo) and (box_gaps(spot, self.box_lo, self.box_hi).min() < ROBOT_RADIUS + 0.2
-                                     or box_gaps(line, self.box_lo, self.box_hi).min() < 0.2):
-                continue
-            ok = True
-            for c, r, d, (lo, hi) in zip(self.obstacle_start, self.obstacle_r, self.obstacle_vel0, self.obstacle_sweep):
-                moving = np.any(d != 0)
-                along = np.linspace(max(lo, -9), min(hi, 9), 60) if moving else np.zeros(1)
-                path = c + along[:, None]*(d/max(np.linalg.norm(d), 1e-9))
-                if np.linalg.norm(path - spot, axis=1).min() < r + ROBOT_RADIUS + (0.35 if moving else 0.2) \
-                        or np.linalg.norm(path[:, None] - line[None], axis=2).min() < r + 0.15:
-                    ok = False
-                    break
-            if ok:
-                out.append(spot)
-        return out
+        """Valid parking spots of dot k: points at reach distance from it, on any side."""
+        tg = self.dots[k]
+        candidates = [tg[:2] - standoff(tg[2])*np.array([np.cos(a), np.sin(a)]) for a in np.arange(0, 2*np.pi, np.pi/18)]
+        return [q for q in candidates if self.spot_ok(q, k)]
+
+    def can_reach_from(self, p, yaw):
+        """The base is already at a good distance from the current dot with a clear line, so it can stop here. If it
+        must still turn a long way, the arm also needs room to swing round."""
+        to_target = self.target[:2] - p
+        if abs(np.linalg.norm(to_target) - standoff(self.target[2])) > REACH_BAND or not self.spot_ok(p, self.current_dot, room=0.1):
+            return False
+        facing = abs(wrap(np.arctan2(to_target[1], to_target[0]) - yaw)) < 0.5
+        return facing or not len(self.box_lo) or box_gaps(p, self.box_lo, self.box_hi).min() >= 0.85
+
+    def crosses_mover(self, a, spot):
+        """Does the route from a to spot cross the sweep of a moving obstacle?"""
+        pts = self.route.path(a, spot) if self.route is not None else None
+        pts = np.vstack([a, *(pts if pts is not None else [spot])])
+        steps = np.vstack([p + np.linspace(0, 1, max(2, int(np.linalg.norm(q - p)/0.1) + 1))[:, None]*(q - p) for p, q in zip(pts[:-1], pts[1:])])
+        for c, r, d, (lo, hi) in zip(self.obstacle_start, self.obstacle_r, self.obstacle_vel0, self.obstacle_sweep):
+            if np.any(d != 0):
+                sweep = c + np.linspace(max(lo, -9), min(hi, 9), 60)[:, None]*(d/np.linalg.norm(d))
+                if np.linalg.norm(steps[:, None] - sweep[None], axis=2).min() < r + ROBOT_RADIUS:
+                    return True
+        return False
 
     def leg(self, a, k):
-        """Length of the base's way from point a to the best parking spot of dot k, and that spot. In a floor plan
-        the spot on the shortest route is chosen, so the robot does not drive around a dot to reach a far side."""
+        """Cost of the base's way from point a to the best parking spot of dot k, and that spot. In a floor plan the spot
+        on the shortest route is chosen, so the robot does not drive around a dot to reach a far side. Crossing a
+        mover's sweep costs extra, so among similar routes the one clear of movers is preferred."""
         if not self.choose_spot:
             spot = self.parks[k] if self.parks is not None else \
                 self.dots[k][:2] - standoff(self.dots[k][2])*(self.dots[k][:2] - a)/max(np.linalg.norm(self.dots[k][:2] - a), 1e-9)
             return float(np.linalg.norm(spot - a)), spot
-        spots = sorted(self.spots(k), key=lambda q: np.linalg.norm(q - a))[:4]
-        if not spots:
-            spots = [self.parks[k] if self.parks is not None else self.fallback_park]
-        best = None
-        for spot in spots:
-            pts = self.route.path(a, spot) if self.route is not None else None
-            length = float(np.sum(np.linalg.norm(np.diff(np.vstack([a, *pts]), axis=0), axis=1))) if pts is not None else float(np.linalg.norm(spot - a)) + 100.0
-            if best is None or length < best[0]:
-                best = (length, spot)
-        return best
+        spots = self.spots(k) or [self.parks[k] if self.parks is not None else self.fallback_park]
+        if self.route is None:
+            best = min(spots, key=lambda q: np.linalg.norm(q - a))
+            return float(np.linalg.norm(best - a)), best
+        field = self.route.lengths_from(a)
+        lengths = [field[self.route.to_cell(q)] for q in spots]
+        i = int(np.argmin(lengths))
+        length = float(lengths[i]) if np.isfinite(lengths[i]) else float(np.linalg.norm(spots[i] - a)) + 100.0
+        return length + (MOVER_CROSS_COST if self.crosses_mover(a, spots[i]) else 0.0), spots[i]
 
     def choose_dot(self, p):
-        """Make the next dot current. "best" compares every order of the remaining dots by route length (fine up to
-        about 6 dots); "nearest" just takes the closest. Recomputed after each pick."""
+        """Make the next dot current. "nearest" takes the closest. "best" compares every order of the remaining dots
+        (fine up to about 6): route length plus a penalty per room change, so the robot finishes a room before leaving
+        it. Among orders within `ORDER_TIE` of the best, it takes the fewest room changes, then the closest dot first, so it
+        does not walk past a dot to save a few centimetres. Recomputed after each pick."""
         if len(self.dots) == 1:
             if self.choose_spot:
                 self.fixed_park = self.leg(p, 0)[1]
@@ -796,13 +960,22 @@ class ObstacleRobot(Robot):
         if self.dot_order == "nearest" or len(self.remaining) == 1:
             k = min(self.remaining, key=lambda i: self.leg(p, i)[0])
         else:
-            def total(order):
-                a, cost = p, 0.0
+            def score(order):
+                a, cost, changes = p, 0.0, 0
                 for i in order:
-                    d, a = self.leg(a, i)
+                    d, spot = self.leg(a, i)
                     cost += d
-                return cost
-            k = min(itertools.permutations(self.remaining), key=total)[0]
+                    if self.route is not None and self.route.room_of(a) != self.route.room_of(spot):
+                        changes += 1
+                    a = spot
+                return cost + ROOM_CHANGE_COST*changes, changes
+            scores = {order: score(order) for order in itertools.permutations(self.remaining)}
+            best = min(c for c, _ in scores.values())
+            close = [order for order, (c, _) in scores.items() if c <= best*(1 + ORDER_TIE)]
+            k = min(close, key=lambda order: (scores[order][1], self.leg(p, order[0])[0]))[0]
+            if self.route is not None:   # within the room the order goes to next, take its closest dot first
+                room = self.route.room_of(self.leg(p, k)[1])
+                k = min((i for i in self.remaining if self.route.room_of(self.leg(p, i)[1]) == room), key=lambda i: self.leg(p, i)[0])
         self.current_dot, self.target = k, self.dots[k]
         if self.choose_spot:
             self.fixed_park = self.leg(p, k)[1]
