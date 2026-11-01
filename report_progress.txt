@@ -10,7 +10,8 @@ CURRENT STATE
 - Expert: RRTExpert in obstacle_env.py, used with --rrt. Without --rrt, the old SteerAround expert runs.
 - Knows exact obstacle positions, sizes, velocities and turning points from the simulator. Uses no lidar.
 - Plans with a time-aware RRT, using moves the base can really make (arcs, spins, reverse, wait).
-- Latest full result: 60/60 clean runs, 0 collisions, 0 timeouts, with new shorten() (same scenarios used for fixes).
+- Fair results: 87/88 single target in a small room, 24/24 new floor plans with 3 dots (20 with a mover).
+- Also handles interior walls, furniture and several dots touched in turn.
 
 DECISIONS AND WHY
 1. Added moving obstacles to the simulator.
@@ -83,7 +84,40 @@ Perfect-information RRT on 60 new scenarios in a 10 m x 10 m room (each row adds
 Notes: timed-out runs count as 60 s in the first two rows' mean arrival, so those means are understated.
 These scenarios were also used to find and fix problems, so a new set is needed for a fair final figure.
 
+FAIR TEST ON NEW SCENARIOS (88 scenarios in a 7 m x 7 m room, none used for fixes)
+  Moving 29/29, mixed 25/26, static 33/33: total 87/88 clean. No timeouts, no wall contact, slowest park 44.3 s.
+
+FLOOR PLAN TESTS (8 m x 8 m room, 1.4 m doorways, about half with one mover)
+  Hand-made layouts: 18/18 clean, mean arrival 25.1 s, slowest 44.8 s.
+  Random layouts (fair test): 30/30 clean, mean arrival 30.6 s, slowest 67.8 s, path 1.35 x straight, closest gap 8.4 cm.
+
+MULTIPLE DOT TESTS (random floor plans, 3 dots each)
+  Same 24 scenarios (5 with a mover):        Clean  Mean total  Path    Legs >60 deg around dot  Runs with a reversal
+    Marker fix only, fixed parking spot      24/24  76.9 s      11.13 m 26/72                    not measured
+    + Chosen parking spot                    23/24  67.9 s       9.30 m  1/72                    3/24
+    + Wide routes                            24/24  68.2 s       9.27 m  1/72                    1/24
+  24 new scenarios (20 with a mover):        24/24  70.1 s       9.25 m  3/72                    7/24
+    All dots touched, closest gap 2.4 cm, slowest 126.6 s.
+  Single-dot random floor plans after these changes: 30/30, mean arrival 28.0 s, path 1.21 x straight.
+  Best order vs nearest (before these fixes): 24/24 each, orders differed in 2/24, best 5.9 s faster in those.
+  BUG, found by the user in the GUI: the first dot was not removed and a piece of furniture or a wall line was
+  removed instead. Fixed. Test results were unchanged by the fix.
+
 WHAT WE FOUND OUT
+- User saw an unnecessary turn-back in fp_005. Cause: A* accepted tight routes (down to 1.1 m) where the arm could not
+  swing round, so RRT backed out and clipped furniture. Change: prefer routes with room to turn (0.67 m clearance, still
+  fits 1.4 m doorways). On fp_005: no turn-back, contacts 233 -> 0, clearance 0 -> 20.7 cm. Retest: 24/24 clean.
+- User saw the robot circling a dot before touching it. Cause: each dot had one fixed parking spot on a random side
+  (26 of 72 legs went more than 60 deg around the dot, adding up to 2.7 m). Change: pick the valid spot on the
+  shortest route. Result: 1 of 72 legs, total time 76.9 -> 67.9 s.
+- With 3 dots, comparing all orders rarely beats going to the nearest dot. Too few cases to generalise.
+- After reaching, the arm settles slightly off its starting pose (joint 6 at about 1.13 rad, not 1.00). The collision
+  circles were measured for the starting pose. No collisions came from it in these tests.
+- The base creeps slowly with its wheels stopped (about 0.5 m over 200 s). Small over a normal stop.
+- A* guiding RRT through doorways works. Walls and furniture block the lidar, as the MLP will need.
+- No mover collisions in the fair test, so the timing buffer and plan rejoining were skipped. Phase 1 is done.
+- The one fair-test collision (traingmi_011) was the back-left wheel clipping a static obstacle for about 0.2 s while
+  turning; the base was off its plan. Replanning sooner did not fix it and caused more replans, so it was reverted.
 - Stopping is not enough: a mover whose path goes through the robot needs the robot to move away.
 - Collisions came from the arm, not from drifting off the plan: 0-0.11 m off plan at contact, and only arm links
   touched in the two runs checked. Adding the arm to the collision check removed all 6 collisions.
@@ -98,9 +132,10 @@ WHAT WE FOUND OUT
   1 run over 40 s (was 4). Closest gap across all runs stayed about 7 cm.
 
 KNOWN PROBLEMS
+- The base can slide off its plan during turns and clip something close by (1 run in 88). Not fixed.
 - Paths are still about 1.3-1.5 times the straight-line distance. Slowest run parks in 40-50 s.
 - Plan quality varies a lot by chance: small code changes moved single static runs by up to 15 s either way.
-- Walls are barely tested: the robot never came within 0.77 m of one.
+- Some direction reversals remain with movers (7 of 24 runs). Not yet checked whether they are needed.
 - Only tested with obstacle radius 0.15-0.30 m and mover speed 0.10-0.30 m/s.
 - The arm circles assume the usual arm start pose (not arm_q0 scenarios).
 - The arm's reach after parking and the last 0.3 m of parking are not checked against obstacles.
@@ -110,18 +145,10 @@ KNOWN PROBLEMS
 
 PLAN (chosen: finish the expert first, then train the MLP once on the final expert)
 Risk accepted: no learned policy until late, and problems with the MLP will show up late.
-Phase 1 - Improve the current expert
-  - Section-by-section shorten(): done. Add a timing buffer around movers.
-  - Try to rejoin the current plan before replanning. Test on a new scenario set and a smaller room.
-Phase 2 - Floor plans
-  - Add interior walls, doorways (at least about 1.2 m wide) and couches as box obstacles.
-  - Add circle-to-rectangle collision checks. Use A* on a grid to guide RRT through doorways.
-  - Start with 2-3 hand-made layouts, then generate random ones.
-Phase 3 - Multiple red dots
-  - The hand touches a dot (within 1 cm, held briefly), the dot disappears, and the next one becomes active.
-  - The arm returns to its driving pose between dots. Test this first, as it is the riskiest part.
-  - Choose the order by comparing all orders (up to about 6 dots) against going to the nearest dot next.
-Phase 4 - MLP
+Phase 1 - Improve the current expert: DONE (87/88 on new scenarios)
+Phase 2 - Floor plans: DONE (48/48 clean, including 30/30 on random layouts)
+Phase 3 - Multiple red dots: DONE (the hand touches a dot, it disappears, the arm returns, the base goes on)
+Phase 4 - MLP: NOT STARTED, waits for the user's go-ahead
   - Collect expert data, add lidar history, train and evaluate. May need an A* waypoint input for floor plans.
 Optional: sweep obstacle sizes and speeds; Bayesian optimisation of expert and MLP settings.
 

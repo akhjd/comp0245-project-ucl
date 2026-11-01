@@ -19,6 +19,8 @@ def main():
     parser.add_argument("--duration", type=float, default=70.0, help="seconds per episode")
     parser.add_argument("--room", type=float, metavar="HALF",
                         help="square room with walls at +-HALF metres; scenarios that do not fit are skipped")
+    parser.add_argument("--dot-order", choices=["best", "nearest"], default="best",
+                        help="with several dots: compare every order, or always go to the closest next")
     parser.add_argument("--rrt", action="store_true", help="use the privileged RRT expert (RRTExpert): true obstacles, no lidar")
     parser.add_argument("--gui", action="store_true")
     args = parser.parse_args()
@@ -39,6 +41,7 @@ def main():
                 print(f"{s['id']}: dropped {dropped} obstacle(s) outside the room")
             fitted.append(s)
         scenarios = fitted
+    scenarios = [{**s, "dot_order": args.dot_order} for s in scenarios]
     if args.rrt:
         scenarios = [{**s, "expert": "rrt"} for s in scenarios]
     out = Path(args.out)

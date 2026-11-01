@@ -9,6 +9,8 @@ Physics change for obstacle runs only: wheel sideways grip 0.1 instead of the co
 """
 import collections
 import contextlib
+import heapq
+import itertools
 import json
 import time
 from pathlib import Path
@@ -26,6 +28,7 @@ LIDAR_HEIGHT = 0.3         # m above the base frame
 LIDAR_ANGLES = np.arange(LIDAR_RAYS) * 2*np.pi/LIDAR_RAYS
 WHEEL_SIDE_GRIP = 0.1      # sideways wheel friction factor; the course uses 0.01 (see ObstacleRobot)
 NAV_TIMEOUT = 50.0         # s: detours with stop-turn-go take longer than the course's 25 s open-ground limit
+RETRACT_RATE, RETRACT_SETTLED = 0.5, 0.05   # rad/s: speed of the arm's return between dots; joint speed counted as stopped
 RRT_NAV_TIMEOUT = 90.0     # s: RRTExpert also waits for movers, so its routes can take longer
 
 WALL_HEIGHT, WALL_THICKNESS = 1.0, 0.1   # m: room walls, taller than the lidar plane
@@ -57,6 +60,94 @@ def fit_to_room(scenario, half):
             o = {**o, "sweep": [-down, up]}
         kept.append(o)
     return {**scenario, "obstacles": kept, "room": [*lo.tolist(), *hi.tolist()]}, dropped
+
+def box_gaps(points, lo, hi):
+    """Distance from points (..., 2) to axis-aligned boxes lo, hi (boxes, 2): array (..., boxes), 0 inside a box."""
+    d = np.maximum(np.maximum(lo - points[..., None, :], points[..., None, :] - hi), 0.0)
+    return np.linalg.norm(d, axis=-1)
+
+class FloorPlanRoute:
+    """A* on a grid over the room, around walls, furniture and static cylinders, to guide RRTExpert between rooms.
+    RRT alone rarely finds a doorway; here it only has to reach the farthest route point it can see. Movers are
+    left to RRT. A route with room to turn (`wide`, which still fits a 1.4 m doorway) is preferred over a shorter one
+    through a tight gap, where the arm cannot swing round; `narrow` is used only if there is no wide route."""
+    cell = 0.1            # m
+    wide, narrow = ROBOT_RADIUS + 0.2, ROBOT_RADIUS + 0.08   # m kept from anything
+    blocked_start = 0.35  # m of a line from an already tight spot that may be in the kept-clear zone
+
+    def __init__(self, room, lo, hi, centres, radii):
+        self.origin = np.asarray(room[:2], dtype=float)
+        n = np.ceil((np.asarray(room[2:]) - self.origin)/self.cell).astype(int) + 1
+        xs = self.origin[0] + self.cell*np.arange(n[0])
+        ys = self.origin[1] + self.cell*np.arange(n[1])
+        grid = np.stack(np.meshgrid(xs, ys, indexing="ij"), axis=-1)
+        gap = np.minimum(grid - self.origin, np.asarray(room[2:]) - grid).min(axis=-1)
+        if len(lo):
+            gap = np.minimum(gap, box_gaps(grid, lo, hi).min(axis=-1))
+        for c, r in zip(centres, radii):
+            gap = np.minimum(gap, np.linalg.norm(grid - c, axis=-1) - r)
+        self.gap = gap
+        self.free = gap >= self.wide
+
+    def to_cell(self, p):
+        return tuple(np.clip(np.round((np.asarray(p) - self.origin)/self.cell).astype(int), 0, np.array(self.free.shape) - 1))
+
+    def nearest_free(self, cell):
+        if self.free[cell]:
+            return cell
+        idx = np.argwhere(self.free)
+        return tuple(idx[np.argmin(np.sum((idx - np.array(cell))**2, axis=1))]) if len(idx) else None
+
+    def sees(self, a, b):
+        """Is the straight line a-b free on the grid?"""
+        length = float(np.linalg.norm(np.asarray(b) - a))
+        n = max(2, int(length/(self.cell/2)) + 1)
+        for u in np.linspace(0, 1, n):
+            if not self.free[self.to_cell(np.asarray(a) + u*(np.asarray(b) - a))] and u*length > self.blocked_start:
+                return False
+        return True
+
+    def path(self, start, goal):
+        """Route points from start to goal (world coordinates), or None if there is no route."""
+        self.free = self.gap >= self.wide
+        pts = self.search(start, goal)
+        if pts is None:
+            self.free = self.gap >= self.narrow
+            pts = self.search(start, goal)
+        return pts
+
+    def search(self, start, goal):
+        a, b = self.nearest_free(self.to_cell(start)), self.nearest_free(self.to_cell(goal))
+        if a is None or b is None:
+            return None
+        best, parent, heap = {a: 0.0}, {}, [(0.0, a)]
+        while heap:
+            _, u = heapq.heappop(heap)
+            if u == b:
+                cells = [u]
+                while cells[-1] in parent:
+                    cells.append(parent[cells[-1]])
+                pts = [self.origin + self.cell*np.array(c) for c in cells[::-1]]
+                return pts[:-1] + [np.asarray(goal, dtype=float)]
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                v = (u[0] + dx, u[1] + dy)
+                if not (0 <= v[0] < self.free.shape[0] and 0 <= v[1] < self.free.shape[1]) or not self.free[v]:
+                    continue
+                cost = best[u] + np.hypot(dx, dy)
+                if cost < best.get(v, np.inf):
+                    best[v], parent[v] = cost, u
+                    heapq.heappush(heap, (cost + np.hypot(b[0] - v[0], b[1] - v[1]), v))
+        return None
+
+    def subgoal(self, p, goal):
+        """The farthest route point visible from p; goal itself if it is visible or there is no route."""
+        pts = self.path(p, goal)
+        if pts is None:
+            return goal
+        for q in pts[::-1]:
+            if self.sees(p, q):
+                return q
+        return pts[min(5, len(pts) - 1)]
 
 def wrap(a):
     return (a + np.pi) % (2*np.pi) - np.pi
@@ -228,6 +319,7 @@ class RRTExpert(SteerAround):
     max_stray = 0.3                # m from the plan's reference that triggers a new plan
     check_every = 0.25             # s between plan checks
     park_handover, park_exit = 0.3, 0.6
+    via_reached = 0.3              # m from a route point at which the next stretch is planned
     controls = np.array([[0.2, 0.0], [0.2, 0.25], [0.2, -0.25], [0.2, 0.5], [0.2, -0.5], [0.1, 0.5], [0.1, -0.5],
                          [0.0, 0.6], [0.0, -0.6], [-0.1, 0.0], [-0.1, 0.4], [-0.1, -0.4]])
 
@@ -257,7 +349,7 @@ class RRTExpert(SteerAround):
         speed = np.linalg.norm(r.obstacle_vel0, axis=1)
         self.d0 = r.obstacle_vel0 / np.maximum(speed, 1e-9)[:, None]
         self.start, self.radius, self.speed, self.sweep = r.obstacle_start.copy(), r.obstacle_r, speed, r.obstacle_sweep
-        self.room = r.room
+        self.room, self.box_lo, self.box_hi = r.room, r.box_lo, r.box_hi
         self.s0 = np.sum((r.obstacle_xy - r.obstacle_start)*self.d0, axis=1)
         self.dir = np.sign(np.sum(r.obstacle_vel*self.d0, axis=1))
 
@@ -287,10 +379,15 @@ class RRTExpert(SteerAround):
                 return False
             if np.any(arm < self.room[:2] + keep_arm) or np.any(arm > self.room[2:] - keep_arm):
                 return False
+        fade = np.clip(1 - ts[:, None]/2.0, 0, 1)   # slack only helps the robot get away from where it starts
+        if len(self.box_lo):
+            if np.any(box_gaps(pts, self.box_lo, self.box_hi) < ROBOT_RADIUS + margin - self.slack_box[None]*fade):
+                return False
+            if np.any(box_gaps(arm, self.box_lo, self.box_hi).min(axis=1) < self.arm_r + margin - self.slack_box_arm[None]*fade):
+                return False
         if len(self.radius) == 0:
             return True
         centres = self.predict(ts)
-        fade = np.clip(1 - ts[:, None]/2.0, 0, 1)   # slack only helps the robot get away from where it starts
         gaps = np.linalg.norm(pts[:, None] - centres, axis=2)
         if np.any(gaps < ROBOT_RADIUS + margin + self.radius - self.slack[None]*fade):
             return False
@@ -322,6 +419,9 @@ class RRTExpert(SteerAround):
         arm_now = self.arm_points(p[None], np.array([yaw]))[0]
         arm_gap = np.linalg.norm(arm_now[:, None] - here[None], axis=2).min(axis=0) if len(self.radius) else np.zeros(0)
         self.slack_arm = np.maximum(self.arm_r + margin + self.radius + 0.02 - arm_gap, 0.0)
+        if len(self.box_lo):
+            self.slack_box = np.maximum(ROBOT_RADIUS + margin + 0.02 - box_gaps(p, self.box_lo, self.box_hi), 0.0)
+            self.slack_box_arm = np.maximum(self.arm_r + margin + 0.02 - box_gaps(arm_now, self.box_lo, self.box_hi).min(axis=0), 0.0)
         self.wall_margin = margin
         if self.room is not None:   # never ask for more wall clearance than the start or the goal has
             room_gap = np.minimum(np.minimum(p, goal) - self.room[:2], self.room[2:] - np.maximum(p, goal)).min()
@@ -460,6 +560,9 @@ class RRTExpert(SteerAround):
                 rows = trial
         return rows[1:]
 
+    def reset_for_next_dot(self):
+        self.plan, self.parking, self.next_check = None, False, self.now
+
     def make_plan(self, p, yaw, goal):
         """Best of `searches` RRT runs with different fixed seeds: the earliest arrival, at the largest margin that
         reaches the goal. Stops early once a plan is about as fast as the straight run."""
@@ -503,6 +606,8 @@ class RRTExpert(SteerAround):
     def wheels(self, p, yaw, velocity, lidar, target):
         to_target = target[:2] - p
         goal = target[:2] - standoff(target[2]) * to_target / max(np.linalg.norm(to_target), 1e-9)
+        if self.robot.fixed_park is not None:   # in a floor plan the line to the target may cross a wall
+            goal = self.robot.fixed_park
         dist = np.linalg.norm(goal - p)
         self.parking = dist < (self.park_exit if self.parking else self.park_handover)
         self.waiting = False
@@ -510,8 +615,13 @@ class RRTExpert(SteerAround):
             return super().wheels(p, yaw, velocity, np.full(LIDAR_RAYS, LIDAR_RANGE), target)
         if self.now >= self.next_check:
             self.next_check = self.now + self.check_every
-            if self.plan is None or not self.plan_ok(p, goal):
-                self.plan = self.make_plan(p, yaw, goal)
+            if self.plan is None or not self.plan_ok(p, self.plan["goal"] if self.plan["via"] else goal) \
+                    or (self.plan["via"] and np.linalg.norm(self.plan["goal"] - p) < self.via_reached):
+                route = self.robot.route
+                sub = route.subgoal(p, goal) if route is not None else goal
+                self.plan = self.make_plan(p, yaw, sub)
+                if self.plan is not None:
+                    self.plan["via"] = bool(np.linalg.norm(sub - goal) > 1e-6)
         if self.plan is None:   # nowhere safe to go right now
             self.waiting = True
             return np.zeros(4), False
@@ -532,6 +642,10 @@ class ObstacleRobot(Robot):
     def __init__(self, config, scenario, gui=False):
         super().__init__(config, scenario, gui)
         p, client = self.p, self.client
+        # robot_env made the first dot's marker last and keeps no id: take it now, before any other body is added
+        first_dot = client.getBodyUniqueId(client.getNumBodies() - 1)
+        if np.linalg.norm(np.array(client.getBasePositionAndOrientation(first_dot)[0]) - self.target) > 1e-6:
+            raise RuntimeError("could not identify the first dot's marker")
         # Course physics give the wheels 1% sideways grip; then a sustained gentle curve (needed to drive around
         # obstacles) builds a sideways slide that grows past 1 m/s. At 10% it stays below about 0.1 m/s.
         # Obstacle runs only: robot_env.py and the course base task keep 0.01.
@@ -571,6 +685,46 @@ class ObstacleRobot(Robot):
                                        basePosition=[cx, cy, 0.005])
             if gui:   # look at the whole room
                 client.resetDebugVisualizerCamera(float(max(x1 - x0, y1 - y0)), 30, -60, [(x0 + x1)/2, (y0 + y1)/2, 0])
+        # Floor plan: axis-aligned boxes {"min": [x, y], "max": [x, y], "kind": "wall" | "furniture", "h": height}.
+        # Interior walls show as flat lines like the room boundary; furniture shows as a solid box. Both count as walls
+        # for contact. fixed_park: choose the parking spot on arrival (see leg), since the line to the target may cross a wall.
+        boxes = scenario.get("boxes", [])
+        self.box_lo = np.array([b["min"] for b in boxes], dtype=float).reshape(-1, 2)
+        self.box_hi = np.array([b["max"] for b in boxes], dtype=float).reshape(-1, 2)
+        for b in boxes:
+            lo, hi = np.array(b["min"], dtype=float), np.array(b["max"], dtype=float)
+            h = b.get("h", WALL_HEIGHT)
+            col = client.createCollisionShape(p.GEOM_BOX, halfExtents=[*((hi - lo)/2), h/2])
+            furniture = b.get("kind") == "furniture"
+            vis = -1
+            if furniture:
+                vis = client.createVisualShape(p.GEOM_BOX, halfExtents=[*((hi - lo)/2), h/2], rgbaColor=[0.55, 0.35, 0.2, 1])
+            self.wall_ids.append(client.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                                        basePosition=[*((lo + hi)/2), h/2]))
+            if not furniture:
+                line = client.createVisualShape(p.GEOM_BOX, halfExtents=[*((hi - lo)/2), 0.005], rgbaColor=[0.9, 0.2, 0.1, 1])
+                client.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=line,
+                                       basePosition=[*((lo + hi)/2), 0.005])
+        self.fixed_park = np.array(scenario["park"], dtype=float) if scenario.get("fixed_park") else None
+        self.choose_spot, self.fallback_park = bool(scenario.get("fixed_park")), self.fixed_park
+        self.route = None
+        if boxes and self.room is not None:
+            static = [o for o in scenario["obstacles"] if "vel" not in o]
+            self.route = FloorPlanRoute(self.room, self.box_lo, self.box_hi, [np.array(o["xy"]) for o in static],
+                                        [o["r"] for o in static])
+        # Several dots: scenario["targets"] and, in floor plans, scenario["parks"]. The hand touches a dot (the usual
+        # success rule), the dot disappears, the arm returns to its driving pose, and the base goes to the next one.
+        self.dots = [np.asarray(t, dtype=float) for t in scenario.get("targets", [scenario["target"]])]
+        self.parks = [np.array(q, dtype=float) for q in scenario["parks"]] if "parks" in scenario else None
+        self.dot_order = scenario.get("dot_order", "best")
+        self.dot_bodies = {}
+        if len(self.dots) > 1:
+            self.dot_bodies[0] = first_dot
+            shape = client.createVisualShape(p.GEOM_SPHERE, radius=0.03, rgbaColor=[1, 0, 0, 0.85])
+            for k, dot in enumerate(self.dots[1:], start=1):
+                self.dot_bodies[k] = client.createMultiBody(baseMass=0, baseVisualShapeIndex=shape, basePosition=dot.tolist())
+        self.remaining, self.picked, self.current_dot = list(range(len(self.dots))), [], 0
+        self.retracting, self.leg_start, self.q_hold = False, 0.0, None
         x, y, yaw = scenario["start"]
         z = client.getBasePositionAndOrientation(self.rid)[0][2]
         client.resetBasePositionAndOrientation(self.rid, [x, y, z], p.getQuaternionFromEuler([0, 0, yaw]))
@@ -587,6 +741,84 @@ class ObstacleRobot(Robot):
         self.base_expert = RRTExpert(self) if scenario.get("expert") == "rrt" else SteerAround()
         self.base_params.nav_timeout = RRT_NAV_TIMEOUT if scenario.get("expert") == "rrt" else NAV_TIMEOUT
         self.arrived = False
+        self.choose_dot(np.array([x, y]))
+
+    def spots(self, k):
+        """Valid parking spots of dot k: points at reach distance from it, on any side, with room for the base and a
+        clear line for the arm, away from static obstacles and from the whole sweep of every mover."""
+        tg, out = self.dots[k], []
+        for angle in np.arange(0, 2*np.pi, np.pi/18):
+            spot = tg[:2] - standoff(tg[2])*np.array([np.cos(angle), np.sin(angle)])
+            line = spot + np.linspace(0, 1, 8)[:, None]*(tg[:2] - spot)
+            if self.room is not None and (np.any(spot < self.room[:2] + ROBOT_RADIUS + 0.2) or np.any(spot > self.room[2:] - ROBOT_RADIUS - 0.2)):
+                continue
+            if len(self.box_lo) and (box_gaps(spot, self.box_lo, self.box_hi).min() < ROBOT_RADIUS + 0.2
+                                     or box_gaps(line, self.box_lo, self.box_hi).min() < 0.2):
+                continue
+            ok = True
+            for c, r, d, (lo, hi) in zip(self.obstacle_start, self.obstacle_r, self.obstacle_vel0, self.obstacle_sweep):
+                moving = np.any(d != 0)
+                along = np.linspace(max(lo, -9), min(hi, 9), 60) if moving else np.zeros(1)
+                path = c + along[:, None]*(d/max(np.linalg.norm(d), 1e-9))
+                if np.linalg.norm(path - spot, axis=1).min() < r + ROBOT_RADIUS + (0.35 if moving else 0.2) \
+                        or np.linalg.norm(path[:, None] - line[None], axis=2).min() < r + 0.15:
+                    ok = False
+                    break
+            if ok:
+                out.append(spot)
+        return out
+
+    def leg(self, a, k):
+        """Length of the base's way from point a to the best parking spot of dot k, and that spot. In a floor plan
+        the spot on the shortest route is chosen, so the robot does not drive around a dot to reach a far side."""
+        if not self.choose_spot:
+            spot = self.parks[k] if self.parks is not None else \
+                self.dots[k][:2] - standoff(self.dots[k][2])*(self.dots[k][:2] - a)/max(np.linalg.norm(self.dots[k][:2] - a), 1e-9)
+            return float(np.linalg.norm(spot - a)), spot
+        spots = sorted(self.spots(k), key=lambda q: np.linalg.norm(q - a))[:4]
+        if not spots:
+            spots = [self.parks[k] if self.parks is not None else self.fallback_park]
+        best = None
+        for spot in spots:
+            pts = self.route.path(a, spot) if self.route is not None else None
+            length = float(np.sum(np.linalg.norm(np.diff(np.vstack([a, *pts]), axis=0), axis=1))) if pts is not None else float(np.linalg.norm(spot - a)) + 100.0
+            if best is None or length < best[0]:
+                best = (length, spot)
+        return best
+
+    def choose_dot(self, p):
+        """Make the next dot current. "best" compares every order of the remaining dots by route length (fine up to
+        about 6 dots); "nearest" just takes the closest. Recomputed after each pick."""
+        if len(self.dots) == 1:
+            if self.choose_spot:
+                self.fixed_park = self.leg(p, 0)[1]
+            return
+        if self.dot_order == "nearest" or len(self.remaining) == 1:
+            k = min(self.remaining, key=lambda i: self.leg(p, i)[0])
+        else:
+            def total(order):
+                a, cost = p, 0.0
+                for i in order:
+                    d, a = self.leg(a, i)
+                    cost += d
+                return cost
+            k = min(itertools.permutations(self.remaining), key=total)[0]
+        self.current_dot, self.target = k, self.dots[k]
+        if self.choose_spot:
+            self.fixed_park = self.leg(p, k)[1]
+
+    def dot_touched(self, state, elapsed):
+        """The hand touched the current dot. Returns True if it was the last one; otherwise starts the arm's return."""
+        k = self.current_dot
+        self.picked.append({"dot": k, "time_s": round(float(elapsed), 3)})
+        self.remaining.remove(k)
+        if k in self.dot_bodies:
+            self.client.removeBody(self.dot_bodies.pop(k))
+        if not self.remaining:
+            return True
+        self.choose_dot(state["base"][:2])
+        self.retracting, self.q_hold = True, state["q"][4:11].copy()
+        return False
 
     def advance_obstacles(self, dt):
         """Move the moving obstacles by dt along their velocity; after `span` metres they turn round.
@@ -637,10 +869,25 @@ class ObstacleRobot(Robot):
     def expert_action(self, state, elapsed):
         if hasattr(self.base_expert, "observe"):
             self.base_expert.observe(elapsed, state["base"][:2], state["yaw"], state["lidar"])
+        if self.retracting:
+            # Ramp the hold pose back: the controller's hold is a joint-space PD, so a jump would swing the arm hard
+            step = np.clip(self.q_init - self.q_hold, -RETRACT_RATE*self.control_dt, RETRACT_RATE*self.control_dt)
+            self.q_hold = self.q_hold + step
+            torque, self.q_des, _ = self.expert.arm_controller(self.dyn, state["q_pin"], state["q"][4:11], state["qd"][4:11],
+                self.q_des, self.q_hold, self.target, state["ee"], self.ee_id, self.shoulder_id, self.lower, self.upper,
+                self.control_dt, self.arm_params, reach_active=False)
+            # Done when the ramp has ended and the arm has settled; it settles a little off q_init (about 0.13 rad at
+            # joint 6), as the hold's PD and gravity compensation leave a small steady error
+            if np.abs(self.q_hold - self.q_init).max() < 1e-9 and np.abs(state["qd"][4:11]).max() < RETRACT_SETTLED:
+                self.retracting, self.arrived, self.leg_start = False, False, elapsed
+                self.q_des = self.q_init.copy()
+                if hasattr(self.base_expert, "reset_for_next_dot"):
+                    self.base_expert.reset_for_next_dot()
+            return np.concatenate([np.zeros(4), torque])
         if not self.arrived:
             wheel, self.arrived = self.base_expert.wheels(state["base"][:2], state["yaw"], state["x"][22:24],
                                                           state["lidar"], self.target)
-            if elapsed > self.base_params.nav_timeout:
+            if elapsed - self.leg_start > self.base_params.nav_timeout:
                 self.base_timed_out = True
             if self.arrived or self.base_timed_out:
                 wheel = np.zeros(4)
@@ -763,8 +1010,11 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                     arrival_time = policy.reach_from
                 dwell = dwell + robot.control_dt if state["error"] <= config["success_tolerance_m"] else 0.0
                 if elapsed >= config["min_success_time_s"] and dwell >= config["success_hold_s"]:
-                    reason = "success"
-                    break
+                    if robot.dot_touched(state, elapsed):
+                        reason = "success"
+                        break
+                    dwell = 0.0
+                    state = robot.measure()   # the current dot changed
                 if lost_distance and np.linalg.norm(robot.target[:2] - state["base"][:2]) > lost_distance:
                     reason = "lost"
                     break
@@ -782,7 +1032,8 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                 "minimum_error_m": float(min(np.min(arrays["error_m"]), state["error"])),
                 "final_standoff_error_m": standoff_error, "final_facing_error_rad": facing_error,
                 "base_arrival_time_s": arrival_time,
-                "contact_steps": contact_steps,
+                "contact_steps": contact_steps, "dots_total": len(robot.dots), "dots_picked": len(robot.picked),
+                "picks": robot.picked,
                 **({"wall_contact_steps": int(arrays["contact_wall"].sum())} if robot.wall_ids else {}),
                 **({"contact_steps_per_obstacle": arrays["contact_obstacle"].sum(axis=0).tolist(),
                     "obstacle_is_moving": [bool(np.any(v != 0)) for v in robot.obstacle_vel0]}

@@ -19,15 +19,21 @@ def draw(ax, s):
         x0, y0, x1, y1 = s["room"]
         ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, ec="tab:brown", lw=3))
         ax.set_xlim(x0 - .3, x1 + .3); ax.set_ylim(y0 - .3, y1 + .3)
+    for b in s.get("boxes", []):
+        (x0, y0), (x1, y1) = b["min"], b["max"]
+        ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0, color="saddlebrown" if b.get("kind") == "furniture" else "tab:red"))
     x, y, yaw = s["start"]
     ax.plot(x, y, "go"); ax.arrow(x, y, .4*np.cos(yaw), .4*np.sin(yaw), color="g", head_width=.08)
-    ax.plot(*s["park"], "k^"); ax.plot(*s["target"][:2], "r*", ms=12)
+    for q in s.get("parks", [s["park"]]):
+        ax.plot(*q, "k^")
+    for t in s.get("targets", [s["target"]]):
+        ax.plot(*t[:2], "r*", ms=12)
     ax.plot([x, s["park"][0]], [y, s["park"][1]], "g:", lw=1)
     for o in s["obstacles"]:
         c = np.array(o["xy"])
         if "vel" in o:
             v = np.array(o["vel"]); d = v/np.linalg.norm(v)
-            lo, hi = o.get("sweep", [-o["span"], o["span"]])
+            lo, hi = o["sweep"] if "sweep" in o else (-o["span"], o["span"])
             ends = np.array([c + lo*d, c + hi*d])
             ax.plot(*ends.T, "-", color="tab:blue", alpha=.4, lw=3)
             ax.add_patch(plt.Circle(c, o["r"], color="tab:blue", alpha=.7))
