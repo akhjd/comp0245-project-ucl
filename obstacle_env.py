@@ -26,6 +26,7 @@ LIDAR_HEIGHT = 0.3         # m above the base frame
 LIDAR_ANGLES = np.arange(LIDAR_RAYS) * 2*np.pi/LIDAR_RAYS
 WHEEL_SIDE_GRIP = 0.1      # sideways wheel friction factor; the course uses 0.01 (see ObstacleRobot)
 NAV_TIMEOUT = 50.0         # s: detours with stop-turn-go take longer than the course's 25 s open-ground limit
+RRT_NAV_TIMEOUT = 90.0     # s: RRTExpert also waits for movers, so its routes can take longer
 
 WALL_HEIGHT, WALL_THICKNESS = 1.0, 0.1   # m: room walls, taller than the lidar plane
 
@@ -206,7 +207,7 @@ class RRTExpert(SteerAround):
     arcs, spin on the spot, reverse) or a wait, so plans respect that the base cannot move sideways. Every sample of
     every edge is checked against where each obstacle will be at that time. `connect` tries to finish from a node
     with "turn to the goal, then drive straight", which gives short plans. The earliest arrival found wins, and
-    `shorten` then removes detours and needless waits. Waiting is only considered when something is moving.
+    `shorten` then removes detours and needless waits without changing the timing it relies on. Waiting is only considered when something is moving.
     The plan is kept while it stays valid, so the route does not change without a reason; it is replaced when the
     robot strays from it or it runs out. Random numbers are seeded from the time, so runs are reproducible.
     A plan is collision-free for the discs (base + arm) and exact predictions; the real base can still slip off it.
@@ -218,7 +219,9 @@ class RRTExpert(SteerAround):
     arm_offsets, arm_r = np.array([0.46, 0.56, 0.66]), 0.07
     horizon_extra = 25.0           # s the plan may take beyond the straight run
     iters, iters_after_found = 1500, 200
-    shorten_iters, wait_trim = 100, 0.5   # tries at shortening a plan; s removed from a wait at a time
+    searches = 4                   # RRT runs per plan, each with its own seed; the best one is kept
+    max_reverse = 4.0              # s of reversing allowed in one plan: for short escapes, not as a way to travel
+    shorten_iters, wait_trim = 300, 0.5   # tries at shortening the best plan; s removed from a wait at a time
     wait_choices = (1.0, 2.0, 4.0)
     v_plan, w_plan = 0.2, 0.6      # m/s, rad/s of connect's straight run and spin (below the limits, to keep up)
     sample_dt, edge_steps = 0.1, 5 # s between samples; samples per edge
@@ -329,7 +332,7 @@ class RRTExpert(SteerAround):
             return direct, True
         straight_time = np.linalg.norm(goal - p)/self.v_plan
         horizon = straight_time + self.horizon_extra
-        nodes, parents, edges = [np.array([*p, yaw, 0.0])], [-1], [np.zeros((0, 6))]
+        nodes, parents, edges, reversed_s = [np.array([*p, yaw, 0.0])], [-1], [np.zeros((0, 6))], [0.0]
         best, best_tail = None, direct
         best_t = direct[-1, 0] if direct is not None else np.inf
         lo, hi = np.minimum(p, goal) - 2.0, np.maximum(p, goal) + 2.0
@@ -341,6 +344,7 @@ class RRTExpert(SteerAround):
             nodes.append(np.array([rows[-1, 1], rows[-1, 2], rows[-1, 3], rows[-1, 0]]))
             parents.append(i)
             edges.append(rows)
+            reversed_s.append(reversed_s[i] + self.sample_dt*np.sum(rows[:, 4] < 0))
             tail = self.connect(*nodes[-1], goal, margin)
             if tail is not None and tail[-1, 0] < best_t:
                 best, best_tail, best_t = len(nodes) - 1, tail, tail[-1, 0]
@@ -380,6 +384,8 @@ class RRTExpert(SteerAround):
             if ts[-1] > horizon:
                 continue
             order = np.argsort(np.hypot(ex[:, -1] - s_xy[0], ey[:, -1] - s_xy[1]))
+            if reversed_s[i] + self.sample_dt*self.edge_steps > self.max_reverse:
+                order = order[self.controls[order, 0] >= 0]
             for k in order[:3]:
                 pts = np.stack([ex[k], ey[k]], axis=1)
                 if self.clear(pts, ts, margin, th + self.edges[k, :, 2]):
@@ -393,72 +399,87 @@ class RRTExpert(SteerAround):
             return parts[::-1]
         if np.isfinite(best_t):
             parts = chain(best) if best is not None else []
-            return self.shorten(np.vstack(parts + [best_tail]), p, yaw, goal, margin, rng), True
+            return np.vstack(parts + [best_tail]), True
         if len(nodes) == 1:
             return None, False
         # Goal not reached: keep the plan that stays safe longest, ending as close to the goal as possible
         i = min(range(1, len(nodes)), key=lambda k: (-round(nodes[k][3], 1), np.linalg.norm(nodes[k][:2] - goal)))
         return np.vstack(chain(i)), False
 
-    def rebuild(self, p, yaw, stops, margin):
-        """Rows for "wait, then turn and drive straight" through stops [(x, y), wait_s], or None if anything is hit."""
-        x, y, th, t, parts = p[0], p[1], yaw, 0.0, []
-        for (q, wait) in stops:
-            if wait > 0:
-                ts = t + self.sample_dt*np.arange(1, int(round(wait/self.sample_dt)) + 1)
-                pts = np.tile([x, y], (len(ts), 1))
-                if not self.clear(pts, ts, margin, np.full(len(ts), th)):
-                    return None
-                parts.append(np.column_stack([ts, pts, np.full(len(ts), th), np.zeros((len(ts), 2))]))
-                t = ts[-1]
-            if np.hypot(q[0] - x, q[1] - y) > 1e-3:
-                rows = self.connect(x, y, th, t, np.asarray(q), margin)
-                if rows is None:
-                    return None
-                parts.append(rows)
-                t, x, y, th = rows[-1, :4]
-        return np.vstack(parts) if parts else None
+    def shortcut(self, rows, i, j, margin):
+        """Replace rows[i+1:j] by a direct move, arriving by rows[j]'s time and with its heading, so everything from
+        j on keeps its exact timing and stays valid. Returns the new rows, or None if it is too slow or hits something."""
+        _, x, y, th = rows[i, :4]
+        seg = self.connect(x, y, th, rows[i, 0], rows[j, 1:3], margin)
+        if seg is None or len(seg) == 0:
+            return None
+        t, th = seg[-1, 0], seg[-1, 3]
+        turn = wrap(rows[j, 3] - th)
+        n_spin = int(np.ceil(abs(turn)/self.w_plan/self.sample_dt))
+        n_wait = int(round((rows[j, 0] - t)/self.sample_dt)) - n_spin - 1
+        if n_wait < 0:
+            return None
+        ts = t + self.sample_dt*np.arange(1, n_wait + n_spin + 1)
+        yaws = np.concatenate([np.full(n_wait, th), th + turn*np.arange(1, n_spin + 1)/max(n_spin, 1)])
+        fill = np.column_stack([ts, np.tile(rows[j, 1:3], (len(ts), 1)), yaws, np.zeros(len(ts)),
+                                np.concatenate([np.zeros(n_wait), np.full(n_spin, np.sign(turn)*self.w_plan)])])
+        if len(fill) and not self.clear(fill[:, 1:3], fill[:, 0], margin, yaws):
+            return None
+        return np.vstack([rows[:i + 1], seg, fill, rows[j:]])
 
-    def shorten(self, rows, p, yaw, goal, margin, rng):
-        """Standard RRT clean-up. Reduce the plan to stops every edge, then repeatedly try to skip stops or trim a
-        wait, keeping a change only if the plan is still collision-free at its new times and arrives earlier."""
-        stops, wait = [], 0.0
-        for k, row in enumerate(rows):
-            if row[4] == 0 and row[5] == 0:
-                wait += self.sample_dt
-            elif (k + 1) % self.edge_steps == 0:
-                stops.append([row[1:3].copy(), round(wait, 1)])
-                wait = 0.0
-        stops.append([goal.copy(), round(wait, 1)])
-        best, best_t = rows, rows[-1, 0]
+    def trim_wait(self, rows, k, margin):
+        """Remove `wait_trim` seconds of the wait containing row k and run everything after it that much earlier.
+        Returns the new rows, or None if the earlier timing would hit something."""
+        n = int(round(self.wait_trim/self.sample_dt))
+        end = k
+        while end < len(rows) - 1 and rows[end + 1, 4] == 0 and rows[end + 1, 5] == 0:
+            end += 1
+        if end - k + 1 < n:
+            return None
+        tail = rows[k + n:].copy()
+        tail[:, 0] -= n*self.sample_dt
+        if not self.clear(tail[:, 1:3], tail[:, 0], margin, tail[:, 3]):
+            return None
+        return np.vstack([rows[:k], tail])
+
+    def shorten(self, rows, p, yaw, margin, rng):
+        """Standard RRT clean-up, keeping the plan's timing valid: repeatedly try a shortcut between two random rows
+        (shorter path, arrival unchanged) or trim a wait (earlier arrival), keeping only collision-free changes."""
+        rows = np.vstack([[0.0, *p, yaw, 0.0, 0.0], rows])
+        length = lambda r: np.linalg.norm(np.diff(r[:, 1:3], axis=0), axis=1).sum()
         for _ in range(self.shorten_iters):
-            trial = [list(q) for q in stops]
-            waits = [k for k, q in enumerate(trial) if q[1] > 0]
-            if waits and rng.random() < 0.5:
-                k = waits[int(rng.integers(len(waits)))]
-                trial[k][1] = round(max(trial[k][1] - self.wait_trim, 0.0), 1)
-            elif len(trial) > 1:
-                i = int(rng.integers(len(trial) - 1))
-                j = int(rng.integers(i + 1, len(trial)))
-                # Skip stops i..j-1, but keep any waiting they contained until the mover check says it can go
-                trial = trial[:i] + [[trial[j][0], sum(q[1] for q in trial[i:j + 1])]] + trial[j + 1:]
+            waits = np.flatnonzero((rows[1:, 4] == 0) & (rows[1:, 5] == 0)) + 1
+            if len(waits) and rng.random() < 0.5:
+                trial = self.trim_wait(rows, int(waits[rng.integers(len(waits))]), margin)
             else:
-                break
-            built = self.rebuild(p, yaw, trial, margin)
-            if built is not None and built[-1, 0] <= best_t + 1e-9:
-                stops, best, best_t = trial, built, built[-1, 0]
-        return best
+                i, j = np.sort(rng.integers(0, len(rows), 2))
+                trial = self.shortcut(rows, i, j, margin) if j - i >= 5 else None
+                if trial is not None and length(trial) >= length(rows) - 1e-6:
+                    trial = None
+            if trial is not None:
+                rows = trial
+        return rows[1:]
 
     def make_plan(self, p, yaw, goal):
+        """Best of `searches` RRT runs with different fixed seeds: the earliest arrival, at the largest margin that
+        reaches the goal. Stops early once a plan is about as fast as the straight run."""
         self.load_world()
         self.plans += 1
-        rng = np.random.default_rng(int(self.now*1000))
+        straight_time = np.linalg.norm(goal - p)/self.v_plan
         fallback = None
         for margin in self.margins:
-            rows, reached = self.search(p, yaw, goal, margin, rng)
-            if reached:
-                return self.store(rows, p, yaw, goal, margin)
-            fallback = fallback or (rows, margin) if rows is not None else fallback
+            best = None
+            for k in range(self.searches):
+                rows, reached = self.search(p, yaw, goal, margin, np.random.default_rng([int(self.now*1000), k]))
+                if reached and (best is None or rows[-1, 0] < best[-1, 0]):
+                    best = rows
+                elif rows is not None and not reached and fallback is None:
+                    fallback = (rows, margin)
+                if best is not None and best[-1, 0] <= 1.05*straight_time:
+                    break
+            if best is not None:
+                seed = np.random.default_rng([int(self.now*1000), self.searches])
+                return self.store(self.shorten(best, p, yaw, margin, seed), p, yaw, goal, margin)
         self.plan_failures += 1
         return self.store(fallback[0], p, yaw, goal, fallback[1]) if fallback else None
 
@@ -564,7 +585,7 @@ class ObstacleRobot(Robot):
             self.q_des = self.q_init.copy()
         # sensor-only either way: never sees scenario["obstacles"]
         self.base_expert = RRTExpert(self) if scenario.get("expert") == "rrt" else SteerAround()
-        self.base_params.nav_timeout = NAV_TIMEOUT
+        self.base_params.nav_timeout = RRT_NAV_TIMEOUT if scenario.get("expert") == "rrt" else NAV_TIMEOUT
         self.arrived = False
 
     def advance_obstacles(self, dt):

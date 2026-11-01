@@ -1,0 +1,133 @@
+PROGRESS REPORT - expert for moving obstacles
+Last updated: 1 Nov 2026 (deadline about 8 Nov)
+
+GOAL
+Build an expert that drives the base to a parking spot and reaches a target while avoiding static and
+moving obstacles. An MLP will then be trained to imitate it from lidar and robot state.
+Order: fix the expert first, then train the MLP.
+
+CURRENT STATE
+- Expert: RRTExpert in obstacle_env.py, used with --rrt. Without --rrt, the old SteerAround expert runs.
+- Knows exact obstacle positions, sizes, velocities and turning points from the simulator. Uses no lidar.
+- Plans with a time-aware RRT, using moves the base can really make (arcs, spins, reverse, wait).
+- Latest full result: 60/60 clean runs, 0 collisions, 0 timeouts, with new shorten() (same scenarios used for fixes).
+
+DECISIONS AND WHY
+1. Added moving obstacles to the simulator.
+   Why: the original obstacles were all static. The old expert collided with a crossing obstacle.
+
+2. Tried a lidar tracker with stop-and-wait, later adding evasion (reversing).
+   Why: stopping fails when a mover's path goes through the robot, as seen in the GUI and contact logs.
+   Replaced by decision 4. Results are in the table below.
+
+3. Tried a lidar-based RRT planner on top of the tracker.
+   Why dropped: it was worse than wait/evade (7/20 against 14/20).
+
+4. Gave the expert perfect obstacle information (teacher-student approach).
+   Why: suggested by faculty as a choice to explore. It separates perception errors from decision errors.
+   Risk: the MLP only sees lidar, so it may not fully match the expert. To be measured after training.
+
+5. Used RRT in the expert, not in the MLP.
+   Why: RRT is a planner that needs a world model and no training. The MLP learns from its demonstrations.
+
+6. Chose RRT over reinforcement learning and Recovery RL for now.
+   Why: the assignment centres on behaviour cloning, and RL would need far more simulator time.
+   Recovery RL is a safety method, not a path finder. It remains a possible later extension.
+
+7. Removed the tracking, planning and privileged options; kept only --rrt.
+   Why: requested, to keep one implementation. SteerAround stays because RRTExpert uses it for parking and
+   dagger.py and eval_obstacles.py use it.
+
+8. Added a room boundary (--room HALF).
+   Why: to bound the space. Walls count as obstacles. They are invisible in the GUI, which shows only a flat
+   red rectangle on the floor, as requested. Movers turn round at the walls.
+
+9. Removed waiting on scenes with no movers.
+   Why: the robot waited about 10 s for no reason on static scenes.
+
+10. Added the arm to the collision check (three small circles along the arm).
+    Why: the logs showed collisions were not caused by drifting off the plan. The arm sticks out about 0.68 m
+    in front of the base, past the 0.59 m the planner protected. Chosen over tucking the arm (which would
+    change the reach and the training data) and over one big circle (which would block narrow gaps).
+
+11. Raised the driving cutoff to 90 s for RRTExpert and limited reversing to 4 s per plan.
+    Why: both timeouts came from the old 50 s cutoff plus slow plans (one plan had 29 s of reversing).
+    A longer RRT search barely helped, so it was not used.
+    Result: timeouts gone, but one new collision and slower mixed runs. Tuning results may be mostly plan randomness.
+
+12. Run up to 4 RRT searches per plan and keep the earliest arrival.
+    Why: reduces the effect of bad luck in the random search. Result: 60/60, runs over 50 s fell from 7 to 1.
+
+13. Chose A* guidance, simple PyBullet boxes and our own collision checks for floor plans.
+    Why: random search struggles with narrow doorways. OMPL had no documented support found for moving
+    obstacles, and ready-made house datasets do not fit PyBullet simply.
+
+RESULTS (collision-free runs that reached the target)
+Experts on the 20 development scenarios (10 moving only, 10 mixed):
+  Static SteerAround                   5/20
+  Wait/evade with lidar tracker       14/20
+  Lidar RRT planner                    7/20
+  Perfect-information RRT             18/20
+
+Perfect-information RRT on 60 new scenarios in a 10 m x 10 m room (each row adds one change to the row above):
+
+  Version                  Clean runs                     Collision  Timeout  Mean arrival (s)        Path / straight
+                           Moving  Mixed  Static  Total   runs       runs     Moving  Mixed  Static   Moving Mixed Static
+  Before arm fix            15/20  18/20   19/20  52/60   6          2        30.0    38.1   24.6     1.36   1.93  1.57
+  + Arm in collision check  20/20  18/20   20/20  58/60   0          2        31.4    38.1   24.1     1.46   1.96  1.58
+  + 90 s cutoff, reverse    20/20  19/20   20/20  59/60   1          0        31.7    42.8   26.2     1.41   2.12  1.67
+    limit
+  + Best of 4 searches      20/20  20/20   20/20  60/60   0          0        29.9    31.7   22.5     1.42   1.76  1.46
+  + New shorten()           20/20  20/20   20/20  60/60   0          0        29.9    28.4   21.0     1.38   1.48  1.33
+
+Notes: timed-out runs count as 60 s in the first two rows' mean arrival, so those means are understated.
+These scenarios were also used to find and fix problems, so a new set is needed for a fair final figure.
+
+WHAT WE FOUND OUT
+- Stopping is not enough: a mover whose path goes through the robot needs the robot to move away.
+- Collisions came from the arm, not from drifting off the plan: 0-0.11 m off plan at contact, and only arm links
+  touched in the two runs checked. Adding the arm to the collision check removed all 6 collisions.
+- Timeouts came from a fixed 50 s driving cutoff plus slow plans. One plan used 29 s of reversing at 0.1 m/s.
+- A longer RRT search barely helps (12x the search saved about 2 s), but running 4 separate searches does:
+  mixed arrival fell from 42.8 to 31.7 s and runs over 50 s fell from 7 to 1.
+- Route quality depends heavily on chance. Small code changes moved single runs by up to 15 s either way, so small
+  before-and-after differences are unreliable.
+- The old shorten() never improved a plan: rebuilding it changed its timing, causing collisions or later arrival.
+  The new version keeps timing valid. Offline, plan length fell from 1.40 to 1.24 times the straight line, and
+  planned arrival from 27.1 to 25.9 s. In the simulator it stayed 60/60, with shorter paths in all sets and only
+  1 run over 40 s (was 4). Closest gap across all runs stayed about 7 cm.
+
+KNOWN PROBLEMS
+- Paths are still about 1.3-1.5 times the straight-line distance. Slowest run parks in 40-50 s.
+- Plan quality varies a lot by chance: small code changes moved single static runs by up to 15 s either way.
+- Walls are barely tested: the robot never came within 0.77 m of one.
+- Only tested with obstacle radius 0.15-0.30 m and mover speed 0.10-0.30 m/s.
+- The arm circles assume the usual arm start pose (not arm_q0 scenarios).
+- The arm's reach after parking and the last 0.3 m of parking are not checked against obstacles.
+- DAgger cannot use RRTExpert yet, because it needs its clock and plan updated while the MLP drives.
+- The 60 scenarios were used to diagnose and fix problems, so a new set is needed for a fair final figure.
+- The MLP does not exist yet in this copy of the repo: no trained models or logs are present.
+
+PLAN (chosen: finish the expert first, then train the MLP once on the final expert)
+Risk accepted: no learned policy until late, and problems with the MLP will show up late.
+Phase 1 - Improve the current expert
+  - Section-by-section shorten(): done. Add a timing buffer around movers.
+  - Try to rejoin the current plan before replanning. Test on a new scenario set and a smaller room.
+Phase 2 - Floor plans
+  - Add interior walls, doorways (at least about 1.2 m wide) and couches as box obstacles.
+  - Add circle-to-rectangle collision checks. Use A* on a grid to guide RRT through doorways.
+  - Start with 2-3 hand-made layouts, then generate random ones.
+Phase 3 - Multiple red dots
+  - The hand touches a dot (within 1 cm, held briefly), the dot disappears, and the next one becomes active.
+  - The arm returns to its driving pose between dots. Test this first, as it is the riskiest part.
+  - Choose the order by comparing all orders (up to about 6 dots) against going to the nearest dot next.
+Phase 4 - MLP
+  - Collect expert data, add lidar history, train and evaluate. May need an A* waypoint input for floor plans.
+Optional: sweep obstacle sizes and speeds; Bayesian optimisation of expert and MLP settings.
+
+NOTES
+- Scenario files: scenarios_obstacles_moving_only.json, scenarios_obstacles_moving_mixed.json,
+  scenarios_obstacles_moving_test.json. The 60 new scenarios are in runs/fresh1/ (ignored by git).
+- Always pass --rrt when collecting data.
+- Example: python collect_obstacles.py --scenarios scenarios_obstacles_moving_mixed.json
+  --out runs/demo1 --only trainmx_003 --room 5 --rrt --duration 60 --gui
