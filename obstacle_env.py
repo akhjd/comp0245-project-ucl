@@ -209,9 +209,13 @@ class RRTExpert(SteerAround):
     `shorten` then removes detours and needless waits. Waiting is only considered when something is moving.
     The plan is kept while it stays valid, so the route does not change without a reason; it is replaced when the
     robot strays from it or it runs out. Random numbers are seeded from the time, so runs are reproducible.
-    A plan is collision-free for the disc model and exact predictions; the real base can still slip off it.
+    A plan is collision-free for the discs (base + arm) and exact predictions; the real base can still slip off it.
     Parking (last `park_handover` m) is SteerAround's."""
-    margins = (0.12, 0.04)         # m of clearance around the robot disc: tried in this order
+    margins = (0.12, 0.04)         # m of clearance around the robot and arm discs: tried in this order
+    # The arm in its driving pose sticks out in front of the base disc. Measured in the base frame, links below the
+    # 0.6 m obstacle tops reach x = 0.68, fingertips (higher up) x = 0.74, within y = +-0.05 up to the fingers.
+    # These discs cover it (assumes the usual arm start pose, not a scenario's arm_q0).
+    arm_offsets, arm_r = np.array([0.46, 0.56, 0.66]), 0.07
     horizon_extra = 25.0           # s the plan may take beyond the straight run
     iters, iters_after_found = 1500, 200
     shorten_iters, wait_trim = 100, 0.5   # tries at shortening a plan; s removed from a wait at a time
@@ -266,16 +270,29 @@ class RRTExpert(SteerAround):
             x = np.where(finite, np.where(y <= W, y, 2*W - y) + lo, x)
         return self.start + x[:, :, None]*self.d0
 
-    def clear(self, pts, ts, margin):
+    def arm_points(self, pts, yaws):
+        """Centres of the arm discs for robot positions pts and headings yaws: (len(pts), discs, 2)."""
+        heading = np.stack([np.cos(yaws), np.sin(yaws)], axis=1)
+        return pts[:, None] + self.arm_offsets[None, :, None]*heading[:, None]
+
+    def clear(self, pts, ts, margin, yaws):
+        """Are the base disc and the arm discs clear of the walls and of every obstacle at these times?"""
+        arm = self.arm_points(pts, yaws)
         if self.room is not None:
-            keep = ROBOT_RADIUS + self.wall_margin
+            keep, keep_arm = ROBOT_RADIUS + self.wall_margin, self.arm_r + self.wall_margin
             if np.any(pts < self.room[:2] + keep) or np.any(pts > self.room[2:] - keep):
+                return False
+            if np.any(arm < self.room[:2] + keep_arm) or np.any(arm > self.room[2:] - keep_arm):
                 return False
         if len(self.radius) == 0:
             return True
-        gaps = np.linalg.norm(pts[:, None] - self.predict(ts), axis=2)
-        need = ROBOT_RADIUS + margin + self.radius - self.slack[None]*np.clip(1 - ts[:, None]/2.0, 0, 1)
-        return bool(np.all(gaps >= need))
+        centres = self.predict(ts)
+        fade = np.clip(1 - ts[:, None]/2.0, 0, 1)   # slack only helps the robot get away from where it starts
+        gaps = np.linalg.norm(pts[:, None] - centres, axis=2)
+        if np.any(gaps < ROBOT_RADIUS + margin + self.radius - self.slack[None]*fade):
+            return False
+        arm_gaps = np.linalg.norm(arm[:, :, None] - centres[:, None], axis=3).min(axis=1)
+        return bool(np.all(arm_gaps >= self.arm_r + margin + self.radius - self.slack_arm[None]*fade))
 
     def connect(self, x, y, yaw, t, goal, margin):
         """Spin to face the goal, drive straight to it: rows (t, x, y, yaw, v, w), or None if it would hit something."""
@@ -289,7 +306,7 @@ class RRTExpert(SteerAround):
         xs = np.concatenate([np.full(n_spin, x), x + gap[0]*frac_run])
         ys = np.concatenate([np.full(n_spin, y), y + gap[1]*frac_run])
         yaws = np.concatenate([yaw + turn*frac_spin, np.full(n_run, yaw + turn)])
-        if not self.clear(np.stack([xs, ys], axis=1), ts, margin):
+        if not self.clear(np.stack([xs, ys], axis=1), ts, margin, yaws):
             return None
         vs = np.concatenate([np.zeros(n_spin), np.full(n_run, self.v_plan)])
         ws = np.concatenate([np.full(n_spin, np.sign(turn)*self.w_plan), np.zeros(n_run)])
@@ -299,10 +316,14 @@ class RRTExpert(SteerAround):
         """RRT from (p, yaw) at time 0. Returns (rows, reached_goal), or (None, False) if not even one edge is free."""
         here = self.predict(np.zeros(1))[0] if len(self.radius) else np.zeros((0, 2))
         self.slack = np.maximum(ROBOT_RADIUS + margin + self.radius + 0.02 - np.linalg.norm(here - p, axis=1), 0.0)
+        arm_now = self.arm_points(p[None], np.array([yaw]))[0]
+        arm_gap = np.linalg.norm(arm_now[:, None] - here[None], axis=2).min(axis=0) if len(self.radius) else np.zeros(0)
+        self.slack_arm = np.maximum(self.arm_r + margin + self.radius + 0.02 - arm_gap, 0.0)
         self.wall_margin = margin
         if self.room is not None:   # never ask for more wall clearance than the start or the goal has
             room_gap = np.minimum(np.minimum(p, goal) - self.room[:2], self.room[2:] - np.maximum(p, goal)).min()
-            self.wall_margin = float(np.clip(room_gap - ROBOT_RADIUS - 0.01, 0.0, margin))
+            arm_gap_wall = np.minimum(arm_now - self.room[:2], self.room[2:] - arm_now).min()
+            self.wall_margin = float(np.clip(min(room_gap - ROBOT_RADIUS, arm_gap_wall - self.arm_r) - 0.01, 0.0, margin))
         direct = self.connect(*p, yaw, 0.0, goal, margin)
         if direct is not None and not (self.speed > 0).any():
             return direct, True
@@ -328,7 +349,7 @@ class RRTExpert(SteerAround):
             node = nodes[i]
             ts = node[3] + self.sample_dt*np.arange(1, int(round(d/self.sample_dt)) + 1)
             pts = np.tile(node[:2], (len(ts), 1))
-            if ts[-1] <= horizon and self.clear(pts, ts, margin):
+            if ts[-1] <= horizon and self.clear(pts, ts, margin, np.full(len(ts), node[2])):
                 add(i, np.column_stack([ts, pts, np.full(len(ts), node[2]), np.zeros((len(ts), 2))]))
                 return True
             return False
@@ -361,7 +382,7 @@ class RRTExpert(SteerAround):
             order = np.argsort(np.hypot(ex[:, -1] - s_xy[0], ey[:, -1] - s_xy[1]))
             for k in order[:3]:
                 pts = np.stack([ex[k], ey[k]], axis=1)
-                if self.clear(pts, ts, margin):
+                if self.clear(pts, ts, margin, th + self.edges[k, :, 2]):
                     add(i, np.column_stack([ts, pts, th + self.edges[k, :, 2],
                                             np.full((self.edge_steps, 2), self.controls[k])]))
                     break
@@ -386,7 +407,7 @@ class RRTExpert(SteerAround):
             if wait > 0:
                 ts = t + self.sample_dt*np.arange(1, int(round(wait/self.sample_dt)) + 1)
                 pts = np.tile([x, y], (len(ts), 1))
-                if not self.clear(pts, ts, margin):
+                if not self.clear(pts, ts, margin, np.full(len(ts), th)):
                     return None
                 parts.append(np.column_stack([ts, pts, np.full(len(ts), th), np.zeros((len(ts), 2))]))
                 t = ts[-1]
