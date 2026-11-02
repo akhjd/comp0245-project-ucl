@@ -1075,7 +1075,7 @@ class ObstacleRobot(Robot):
         return np.concatenate([wheel, torque])
 
 def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False, lost_distance=None, save_every=1,
-            perturb=None, label_arm=False):
+            perturb=None, label_arm=False, learned_wheels=None, contact_limit_s=None, stall_limit_s=None):
     """Like robot_env.rollout, plus lidar, collisions and base arrival. policy.act(state) -> 11 commands.
 
     label_expert (DAgger): while a learned policy drives, also ask the base expert what wheel speeds it would use
@@ -1095,7 +1095,12 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
     what the motors actually got; delay_part "wheels" (default) or "all": the stiff arm PD
     becomes unstable with ~20 ms delay, which would hide the base result), push_sign (+1 left, -1 right), seed. Noise only changes what the controller SEES
     (policy, or the expert when policy is None); recorded observations, the referee and DAgger labels
-    (label_expert) use the true sensors. When lidar is perturbed the seen lidar is saved as "lidar_seen"."""
+    (label_expert) use the true sensors. When lidar is perturbed the seen lidar is saved as "lidar_seen".
+
+    learned_wheels(state, robot, elapsed) -> 4 wheel speeds (DAgger with RRTExpert): the expert still runs every step, so its
+    clock and plan stay current and it controls the arm, but the learned wheels move the robot. The expert's wheels never do;
+    they are saved as "expert_wheels". contact_limit_s / stall_limit_s end such a run as "crashed" / "stalled" after that
+    much contact in total, or that long without moving 5 cm or touching a dot, to avoid simulating a hopeless run."""
     folder = Path(folder)
     if folder.exists():
         raise FileExistsError(f"Refusing to overwrite episode: {folder}")
@@ -1105,7 +1110,7 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
         with (folder/"simulator.log").open("w") as log, contextlib.redirect_stdout(log):
             robot = ObstacleRobot(config, scenario, gui)
             keys = ["observations", "lidar", "actions", "applied_actions", "raw_actions", "time_s", "ee_m",
-                    "error_m", "base_m", "inference_ms", "arm_q_rad", "contact"] + (["expert_wheels"] if label_expert else []) \
+                    "error_m", "base_m", "inference_ms", "arm_q_rad", "contact"] + (["expert_wheels"] if label_expert or learned_wheels else []) \
                    + (["expert_arm"] if label_arm else []) + (["obstacle_xy"] if robot.has_moving_obstacles else []) \
                    + (["contact_obstacle"] if robot.has_moving_obstacles else []) \
                    + (["waiting"] if hasattr(robot.base_expert, "waiting") else []) \
@@ -1120,6 +1125,7 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
             delay_steps = int(round(pert.get("delay_ms", 0) / (1000*robot.control_dt)))
             pending = collections.deque()
             elapsed, dwell, clipped, reason = 0.0, 0.0, 0, "timeout"
+            contact_time, moved_at, moved_from, picks_seen = 0.0, 0.0, None, 0
             arrival_time = None
             min_clearance = robot.clearance()
             state = robot.measure()
@@ -1131,6 +1137,9 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                     lid[rng.random(LIDAR_RAYS) < pert.get("lidar_dropout", 0)] = LIDAR_RANGE
                     seen = {**state, "lidar": np.clip(lid, LIDAR_START, LIDAR_RANGE)}
                 raw = robot.expert_action(seen, elapsed) if policy is None else policy.act(seen)
+                if learned_wheels is not None:
+                    rows["expert_wheels"].append(clip_action(raw, config)[:4])
+                    raw = np.concatenate([learned_wheels(seen, robot, elapsed), raw[4:]])
                 latency = (time.perf_counter() - start)*1000
                 action = clip_action(raw, config)
                 clipped += int(np.any(np.abs(raw - action) > 1e-10))
@@ -1188,6 +1197,17 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                         break
                     dwell = 0.0
                     state = robot.measure()   # the current dot changed
+                if contact_limit_s:
+                    contact_time += robot.control_dt*bool(rows["contact"][-1])
+                    if contact_time >= contact_limit_s:
+                        reason = "crashed"
+                        break
+                if stall_limit_s:
+                    if moved_from is None or np.linalg.norm(state["base"][:2] - moved_from) > 0.05 or len(robot.picked) != picks_seen:
+                        moved_at, moved_from, picks_seen = elapsed, state["base"][:2].copy(), len(robot.picked)
+                    if elapsed - moved_at >= stall_limit_s:
+                        reason = "stalled"
+                        break
                 if lost_distance and np.linalg.norm(robot.target[:2] - state["base"][:2]) > lost_distance:
                     reason = "lost"
                     break
@@ -1199,7 +1219,7 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
             # contact is sampled before each step, so also check the state the last step left behind
             contact_steps = int(arrays["contact"].sum()) + int(robot.touching())
             summary = {"scenario_id": scenario["id"], "split": scenario["split"],
-                "controller": "expert" if policy is None else "learned",
+                "controller": "expert" if policy is None and learned_wheels is None else "learned",
                 "success": reason == "success" and contact_steps == 0, "reached_target": reason == "success",
                 "termination": reason, "simulation_time_s": elapsed, "final_error_m": state["error"],
                 "minimum_error_m": float(min(np.min(arrays["error_m"]), state["error"])),

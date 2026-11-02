@@ -1,5 +1,5 @@
-PROGRESS REPORT - expert for moving obstacles
-Last updated: 1 Nov 2026 (deadline about 8 Nov)
+PROGRESS REPORT - expert and MLP for moving obstacles
+Last updated: 2 Nov 2026 (deadline about 8 Nov)
 
 GOAL
 Build an expert that drives the base to a parking spot and reaches a target while avoiding static and
@@ -12,6 +12,9 @@ CURRENT STATE
 - Plans with a time-aware RRT, using moves the base can really make (arcs, spins, reverse, wait).
 - Latest fair result: 35/36 new floor plans with 3 dots. Usually collision-free, not guaranteed.
 - Also handles interior walls, furniture and several dots touched in turn.
+- Dataset: 1625 clean expert runs in five cases, about 5.5 million rows.
+- MLP: first model trained without DAgger (runs/mlp1/best.pt, validation R2 0.949). It fails when driving: 0/7 runs, 0/11 dots.
+- DAgger with the RRT expert is written (dagger_mlp.py) and has not been run yet.
 
 DECISIONS AND WHY
 1. Added moving obstacles to the simulator.
@@ -79,6 +82,38 @@ DECISIONS AND WHY
 17. Keep 0.2 m from movers in plans, and move to the safest nearby place when no plan exists, instead of freezing.
     Why: fair test found the robot frozen and pushed about 1 m by a mover (fp_021, 23 cm overlap): a plan passed a mover
     by 5 cm, the base fell behind it, and with no valid plan left the robot stood still.
+
+18. MLP inputs are only: lidar history, its own pose and velocity, and the current dot's position. No A* and no map.
+    Why: this is imitation learning. The expert may use perfect information, A* and RRT, but only to make demonstrations.
+    Expected cost: finding a doorway from local lidar alone may be hard. To be measured.
+
+19. Pure imitation for dot choice: the MLP gets the positions of all remaining dots and learns which to go to from the expert.
+    This replaces "current dot's position" in decision 18. Why: no hand-written order logic in the learned policy.
+    Risk: harder to train. The expert's order is mostly closest-first but depends on rooms and movers, which the MLP
+    cannot fully see, and the MLP must learn to pick a target and hold it. To be measured.
+
+20. The MLP outputs wheel commands only. Dots are not sorted by distance: they stay in their fixed scenario order.
+    Why: chosen by the user, to keep the inputs exactly as agreed.
+
+21. Data collection first, no training until the user says so. Keep only successful, contact-free runs, each at most 2 min.
+    Five cases: open room without / with obstacles, hard floor plan without / with obstacles, hard plan + obstacles + 3 dots.
+    Every 10th control step is saved (10 ms). Old test trajectories (39 GB) were deleted to free disk; summaries were kept.
+
+22. MLP details: 199 inputs (5 lidar frames over the last 1 s, pose, velocity, 3 dot slots relative to the robot, each with a
+    still-there flag). Outputs: 4 wheel speeds. Network: 3 layers of 256, batch 1024, Adam starting at 0.001.
+    Why: matches decisions 18-20. The expert's current dot is left out so that dot choice is learned by imitation.
+    Why a small network first: the larger one is about 2.5x slower per epoch, and the inputs are small.
+
+23. Convergence is judged from validation loss over the last 10 epochs, plus the gap to train loss and the error per case.
+    Why: a loss curve alone hides a hard case being learned badly. Learning rate halves after 4 flat epochs; training stops
+    after 12 epochs without improvement; the best validation epoch is the one saved.
+    The test split (82 runs) is kept unseen for the final evaluation.
+
+24. DAgger with the RRT expert (dagger_mlp.py): the MLP drives the wheels while the expert keeps running, labels each state,
+    and controls the arm, including when to reach. Each round drives 30 training scenarios per case, retrains from scratch on
+    all data, and tests driving on the validation scenarios. Runs end early after 2 s of contact or 20 s without moving.
+    Why: requested by the user, and the first model failed from states the expert rarely visits, such as standing still.
+    Limit: only the wheels are learned, so the driving scores include expert help with the arm.
 
 RESULTS (collision-free runs that reached the target)
 Experts on the 20 development scenarios (10 moving only, 10 mixed):
@@ -160,6 +195,31 @@ WHAT WE FOUND OUT
   planned arrival from 27.1 to 25.9 s. In the simulator it stayed 60/60, with shorter paths in all sets and only
   1 run over 40 s (was 4). Closest gap across all runs stayed about 7 cm.
 
+DATA COLLECTION RESULTS (2 Nov, about 5.7 h with 7 jobs, 3.97 GB)
+  Ran 1650 expert runs and kept 1625. The other 25 hit the 2 min cap or touched something.
+  Case                                     Kept     Mean time  Split train/val/test
+  1 Easy room, no obstacles                150/150  19.4 s     135/8/7
+  2 Easy room, obstacles                   396/400  25.4 s     356/20/20
+  3 Hard floor plan, no obstacles          300/300  30.2 s     270/15/15
+  4 Hard floor plan, obstacles             490/500  30.2 s     441/24/25
+  5 Hard floor plan, obstacles, 3 dots     289/300  71.1 s     259/15/15
+
+MLP TRAINING RESULTS (runs/mlp1, 2 Nov, about 13 min on CPU)
+  Train: 1461 runs, 5,154,384 rows. Validation: 82 runs, 288,264 rows. Stopped early after 17 of 60 epochs.
+  Verdict: OVERFITTING. Best epoch 5 was kept: validation loss 0.0509, R2 0.949, wheel RMSE 0.269 rad/s.
+  Validation loss then stayed around 0.052-0.060 while train loss kept falling, 0.032 -> 0.015.
+  RMSE at best epoch (rad/s): moving 0.286, stopped 0.096; case 1 0.115, case 2 0.252, case 3 0.262, case 4 0.285, case 5 0.282.
+  Meaning: it learned most of the wheel commands within 5 epochs, then began fitting details of the training runs.
+  Cases with obstacles or hard floor plans are about 2.2-2.5x harder than the easy empty room.
+
+FIRST DRIVING CHECK OF runs/mlp1 (7 validation runs, all five cases; not a full evaluation)
+  0/7 successful, 0/11 dots. 4 timeouts, 2 stalled, 1 crashed. It barely moves, even in the easy empty room.
+  Driving code checked: its commands match the training pipeline on saved rows to within 0.000005 rad/s, so this is not an input bug.
+  Cause: the MLP mostly copies its current velocity instead of deciding where to go (known as the copycat or inertia problem).
+    Velocity alone (linear fit) explains R2 0.898 of the wheel commands. Hiding velocity from the MLP: R2 0.947 -> -0.15.
+    Hiding the dots: R2 unchanged. Robot still while the expert commands motion: expert 2.26 rad/s, MLP 0.06 rad/s.
+  So the high R2 did not mean it learned to drive, and the overfitting was not the main problem.
+
 KNOWN PROBLEMS
 - The base can slide off its plan during turns and clip something close by (1 run in 88). Not fixed.
 - Paths are still about 1.3-1.5 times the straight-line distance. Slowest run parks in 40-50 s.
@@ -170,22 +230,37 @@ KNOWN PROBLEMS
 - Only tested with obstacle radius 0.15-0.30 m and mover speed 0.10-0.30 m/s.
 - The arm circles assume the usual arm start pose (not arm_q0 scenarios).
 - The arm's reach after parking and the last 0.3 m of parking are not checked against obstacles.
-- DAgger cannot use RRTExpert yet, because it needs its clock and plan updated while the MLP drives.
 - The 60 scenarios were used to diagnose and fix problems, so a new set is needed for a fair final figure.
-- The MLP does not exist yet in this copy of the repo: no trained models or logs are present.
+- The MLP cannot see the arm. After touching a dot it may creep instead of waiting for the arm to return. To be checked when driving.
+- The first MLP ignores the dots and copies its velocity, so it cannot start moving. DAgger may reduce this; to be measured.
 
 PLAN (chosen: finish the expert first, then train the MLP once on the final expert)
 Risk accepted: no learned policy until late, and problems with the MLP will show up late.
 Phase 1 - Improve the current expert: DONE (87/88 on new scenarios)
 Phase 2 - Floor plans: DONE (48/48 clean, including 30/30 on random layouts)
 Phase 3 - Multiple red dots: DONE (the hand touches a dot, it disappears, the arm returns, the base goes on)
-Phase 4 - MLP: NOT STARTED, waits for the user's go-ahead
-  - Collect expert data, add lidar history, train and evaluate. May need an A* waypoint input for floor plans.
+Phase 4 - MLP: IN PROGRESS
+  - Data collection: DONE.
+  - First training: DONE (runs/mlp1).
+  - Driving test: written into dagger_mlp.py; first check failed (see above).
+  - Next: run DAgger (python dagger_mlp.py --start runs/mlp1/best.pt --out runs/dagger1) and compare driving per round.
+
+TODO (after DAgger finishes)
+  - Lidar and velocity noise: add small random noise to the inputs during training.
+    Why: exact readings are harder to memorise, and the MLP gets used to being slightly off the expert's path.
+    Cost: small code change, one training run.
+  - Mirrored data: flip each scene left to right (lidar order, y positions, left/right wheels).
+    Why: effectively doubles the variety with no new simulation.
+    Cost: small code change, one training run; the flip needs checking carefully.
+
 Optional: sweep obstacle sizes and speeds; Bayesian optimisation of expert and MLP settings.
 
 NOTES
 - Scenario files: scenarios_obstacles_moving_only.json, scenarios_obstacles_moving_mixed.json,
   scenarios_obstacles_moving_test.json. The 60 new scenarios are in runs/fresh1/ (ignored by git).
 - Always pass --rrt when collecting data.
+- Dataset: python make_dataset.py --out runs/dataset, bash run_dataset.sh runs/dataset 7, python report_dataset.py runs/dataset.
+- Training: python train_mlp.py --check (checks data only), python train_mlp.py --out runs/mlp1. Results are in runs/mlp1/:
+  best.pt, metrics.csv, curves.png, result.json.
 - Example: python collect_obstacles.py --scenarios scenarios_obstacles_moving_mixed.json
   --out runs/demo1 --only trainmx_003 --room 5 --rrt --duration 60 --gui

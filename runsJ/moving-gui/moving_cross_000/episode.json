@@ -1,0 +1,89 @@
+{
+  "scenario": {
+    "id": "moving_cross_000",
+    "split": "train",
+    "start": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "target": [
+      3.5,
+      0.0,
+      0.7
+    ],
+    "park": [
+      2.6,
+      0.0
+    ],
+    "obstacles": [
+      {
+        "xy": [
+          1.5,
+          -1.2
+        ],
+        "r": 0.25,
+        "vel": [
+          0.0,
+          0.2
+        ],
+        "span": 3.0
+      }
+    ],
+    "seed": 1,
+    "expert": "tracking"
+  },
+  "settings": {
+    "roboenv_root": "/home/julia/Desktop/AI_For_Robotics_Course/RoboEnv",
+    "course_root": "/home/julia/LAB_SESSION",
+    "seed": 42,
+    "physics_steps_per_action": 1,
+    "history": 3,
+    "duration_s": 40.0,
+    "success_tolerance_m": 0.01,
+    "success_hold_s": 0.25,
+    "min_success_time_s": 8.0,
+    "wheel_limit_rad_s": 12.0,
+    "arm_limit_nm": 30.0,
+    "models": {
+      "ridge": {
+        "alpha": 10.0
+      },
+      "mlp": {
+        "hidden_layer_sizes": [
+          64,
+          64
+        ],
+        "alpha": 0.01,
+        "max_iter": 25,
+        "batch_size": 256,
+        "verbose": true
+      },
+      "forest": {
+        "n_estimators": 40,
+        "max_depth": 16,
+        "min_samples_leaf": 5,
+        "n_jobs": 1
+      }
+    }
+  },
+  "source_sha256": {
+    "/home/julia/Desktop/AI_For_Robotics_Course/RoboEnv/configs/robotnik_arm.json": "ee65349b469a95257f8e94fc06c22d76629f2b3b6f45ac74521c0e059de9bdf2",
+    "/home/julia/LAB_SESSION/final/robotnik_arm_task/robotnik_arm_control.py": "1fd0baf658406c142e1dbb02c51f225e30bc60cb22ff0a0a6192f2ba9cc990e9",
+    "/home/julia/LAB_SESSION/final/robotnik_arm_task/robotnik_arm_task.py": "a8de247c79a5aa8ffb80c86e70ae4eb6a0afb4d60da2b89fb584924ea0eea94e"
+  },
+  "final_ee_m": [
+    3.4936995564618196,
+    -3.263548160068017e-05,
+    0.7003284983118258
+  ],
+  "lidar": {
+    "rays": 36,
+    "start_m": 0.5,
+    "range_m": 4.0,
+    "height_m": 0.3
+  },
+  "obstacle_height_m": 0.6,
+  "wheel_side_grip": 0.1,
+  "saved_every": 1
+}

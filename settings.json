@@ -1,6 +1,6 @@
 {
-  "roboenv_root": "/home/akhjd/ros2_ws/RoboEnv",
-  "course_root": "/home/akhjd/ros2_ws/LAB_SESSION_COMP_0245_2026_PUBLIC",
+  "roboenv_root": "/home/julia/Desktop/AI_For_Robotics_Course/RoboEnv",
+  "course_root": "/home/julia/LAB_SESSION",
   "seed": 42,
   "physics_steps_per_action": 1,
   "history": 3,

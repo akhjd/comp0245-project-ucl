@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "feature_names": [
+    "base_x_m",
+    "base_y_m",
+    "base_z_m",
+    "sin_yaw",
+    "cos_yaw",
+    "target_x_m",
+    "target_y_m",
+    "target_z_m",
+    "arm_q_0_rad",
+    "arm_q_1_rad",
+    "arm_q_2_rad",
+    "arm_q_3_rad",
+    "arm_q_4_rad",
+    "arm_q_5_rad",
+    "arm_q_6_rad",
+    "arm_qd_0_rad_s",
+    "arm_qd_1_rad_s",
+    "arm_qd_2_rad_s",
+    "arm_qd_3_rad_s",
+    "arm_qd_4_rad_s",
+    "arm_qd_5_rad_s",
+    "arm_qd_6_rad_s",
+    "base_v_x_m_s",
+    "base_v_y_m_s",
+    "base_v_z_m_s",
+    "base_w_x_rad_s",
+    "base_w_y_rad_s",
+    "base_w_z_rad_s"
+  ],
+  "action_names": [
+    "wheel_front_right_rad_s",
+    "wheel_front_left_rad_s",
+    "wheel_back_left_rad_s",
+    "wheel_back_right_rad_s",
+    "arm_tau_0_nm",
+    "arm_tau_1_nm",
+    "arm_tau_2_nm",
+    "arm_tau_3_nm",
+    "arm_tau_4_nm",
+    "arm_tau_5_nm",
+    "arm_tau_6_nm"
+  ],
+  "lidar_rays": 36,
+  "settings": {
+    "roboenv_root": "/home/julia/Desktop/AI_For_Robotics_Course/RoboEnv",
+    "course_root": "/home/julia/LAB_SESSION",
+    "seed": 42,
+    "physics_steps_per_action": 1,
+    "history": 3,
+    "duration_s": 40.0,
+    "success_tolerance_m": 0.01,
+    "success_hold_s": 0.25,
+    "min_success_time_s": 8.0,
+    "wheel_limit_rad_s": 12.0,
+    "arm_limit_nm": 30.0,
+    "models": {
+      "ridge": {
+        "alpha": 10.0
+      },
+      "mlp": {
+        "hidden_layer_sizes": [
+          64,
+          64
+        ],
+        "alpha": 0.01,
+        "max_iter": 25,
+        "batch_size": 256,
+        "verbose": true
+      },
+      "forest": {
+        "n_estimators": 40,
+        "max_depth": 16,
+        "min_samples_leaf": 5,
+        "n_jobs": 1
+      }
+    }
+  },
+  "scenarios_file": "scenarios_obstacles_moving_test.json",
+  "scenarios": [
+    {
+      "id": "moving_cross_000",
+      "split": "train",
+      "start": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "target": [
+        3.5,
+        0.0,
+        0.7
+      ],
+      "park": [
+        2.6,
+        0.0
+      ],
+      "obstacles": [
+        {
+          "xy": [
+            1.5,
+            -1.2
+          ],
+          "r": 0.25,
+          "vel": [
+            0.0,
+            0.2
+          ],
+          "span": 3.0
+        }
+      ],
+      "seed": 1,
+      "expert": "tracking"
+    }
+  ],
+  "episodes": [
+    {
+      "path": "moving_cross_000",
+      "scenario_id": "moving_cross_000",
+      "split": "train",
+      "controller": "expert",
+      "success": true,
+      "reached_target": true,
+      "termination": "success",
+      "simulation_time_s": 20.896000000002555,
+      "final_error_m": 0.006309085907905406,
+      "minimum_error_m": 0.006309085907905406,
+      "final_standoff_error_m": 0.04367603256508268,
+      "final_facing_error_rad": 0.005213542325258835,
+      "base_arrival_time_s": 18.612999999999765,
+      "contact_steps": 0,
+      "contact_fraction": 0.0,
+      "min_lidar_m": 0.7774242024462239,
+      "min_clearance_m": 0.27124178822051065,
+      "base_path_length_m": 2.5302867945458716,
+      "clipped_action_fraction": 0.0,
+      "base_nav_timeout_triggered": false,
+      "control_period_s": 0.001,
+      "samples": 20896,
+      "perturb": {},
+      "wait_time_s": 6.681000000000788
+    }
+  ]
+}

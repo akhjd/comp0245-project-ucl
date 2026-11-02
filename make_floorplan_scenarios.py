@@ -141,6 +141,27 @@ def sample(rng, name, args):
             if any(min(segment_distance(q, a, np.array(t[:2])) for q in sweep) < m["r"] + 0.15 for a, t in zip(parks, targets)):
                 continue
             obstacles.append(m)
+        statics = []
+        for _ in range(int(rng.integers(args.static_count[0], args.static_count[1] + 1))):
+            for _ in range(100):
+                c, r = rng.uniform(room_lo + 0.5, room_hi - 0.5), rng.uniform(*args.radius)
+                if not clear_of(c, lo, hi, r + 1.1) or np.linalg.norm(c - start) < r + ROBOT_RADIUS + 0.45:
+                    continue
+                if any(np.linalg.norm(c - q) < r + ROBOT_RADIUS + 0.2 for q in parks):
+                    continue
+                if any(segment_distance(c, a, np.array(t[:2])) < r + 0.15 for a, t in zip(parks, targets)):
+                    continue
+                if any(np.linalg.norm(c - np.array(o["xy"])) < r + o["r"] + 1.2 for o in statics):
+                    continue
+                if any(min(np.linalg.norm(c - q) for q in np.array(m["xy"]) + np.linspace(*m["sweep"], 40)[:, None]*np.array(m["vel"])/np.linalg.norm(m["vel"])) < r + m["r"] + 0.3 for m in obstacles):
+                    continue
+                statics.append({"xy": [round(float(v), 4) for v in c], "r": round(float(r), 3)})
+                break
+        if statics:   # the cylinders must leave a route to every spot
+            with_statics = FloorPlanRoute(ROOM, lo, hi, [np.array(o["xy"]) for o in statics], [o["r"] for o in statics])
+            if any(with_statics.path(start, q) is None for q in parks):
+                continue
+            obstacles = obstacles + statics
         rnd = lambda v: [round(float(x), 4) for x in v]
         return {"layout": name, "room": ROOM, "boxes": layout["boxes"], "fixed_park": True, "start": rnd([*start, yaw]),
                 "target": rnd([*target, z]), "park": rnd(park), "obstacles": obstacles,
@@ -156,6 +177,8 @@ def main():
     parser.add_argument("--cross-rooms", type=float, default=0.7)
     parser.add_argument("--mover-share", type=float, default=0.5)
     parser.add_argument("--dots", type=int, default=1, help="red dots per scenario")
+    parser.add_argument("--static-count", type=int, nargs=2, default=[0, 0], metavar=("LO", "HI"), help="static cylinders per scenario")
+    parser.add_argument("--radius", type=float, nargs=2, default=[0.15, 0.3], help="static cylinder radius, metres")
     parser.add_argument("--height", type=float, nargs=2, default=[0.35, 0.8], help="target height, metres")
     args = parser.parse_args()
     out = Path(args.out)
