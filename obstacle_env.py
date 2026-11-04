@@ -1075,7 +1075,7 @@ class ObstacleRobot(Robot):
         return np.concatenate([wheel, torque])
 
 def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False, lost_distance=None, save_every=1,
-            perturb=None, label_arm=False, learned_wheels=None, contact_limit_s=None, stall_limit_s=None):
+            perturb=None, label_arm=False, learned_wheels=None, contact_limit_s=None, stall_limit_s=None, learned_arm=None):
     """Like robot_env.rollout, plus lidar, collisions and base arrival. policy.act(state) -> 11 commands.
 
     label_expert (DAgger): while a learned policy drives, also ask the base expert what wheel speeds it would use
@@ -1100,7 +1100,10 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
     learned_wheels(state, robot, elapsed) -> 4 wheel speeds (DAgger with RRTExpert): the expert still runs every step, so its
     clock and plan stay current and it controls the arm, but the learned wheels move the robot. The expert's wheels never do;
     they are saved as "expert_wheels". contact_limit_s / stall_limit_s end such a run as "crashed" / "stalled" after that
-    much contact in total, or that long without moving 5 cm or touching a dot, to avoid simulating a hopeless run."""
+    much contact in total, or that long without moving 5 cm or touching a dot, to avoid simulating a hopeless run.
+
+    learned_arm(state, robot, elapsed) -> 7 arm torques, or None to keep the expert's: the expert still runs every step, and
+    its arm torques are saved as "expert_arm" whenever this is given."""
     folder = Path(folder)
     if folder.exists():
         raise FileExistsError(f"Refusing to overwrite episode: {folder}")
@@ -1111,7 +1114,7 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
             robot = ObstacleRobot(config, scenario, gui)
             keys = ["observations", "lidar", "actions", "applied_actions", "raw_actions", "time_s", "ee_m",
                     "error_m", "base_m", "inference_ms", "arm_q_rad", "contact"] + (["expert_wheels"] if label_expert or learned_wheels else []) \
-                   + (["expert_arm"] if label_arm else []) + (["obstacle_xy"] if robot.has_moving_obstacles else []) \
+                   + (["expert_arm"] if label_arm or learned_arm else []) + (["obstacle_xy"] if robot.has_moving_obstacles else []) \
                    + (["contact_obstacle"] if robot.has_moving_obstacles else []) \
                    + (["waiting"] if hasattr(robot.base_expert, "waiting") else []) \
                    + (["contact_wall"] if robot.wall_ids else [])
@@ -1140,6 +1143,11 @@ def rollout(config, scenario, folder, policy=None, gui=False, label_expert=False
                 if learned_wheels is not None:
                     rows["expert_wheels"].append(clip_action(raw, config)[:4])
                     raw = np.concatenate([learned_wheels(seen, robot, elapsed), raw[4:]])
+                if learned_arm is not None:
+                    rows["expert_arm"].append(clip_action(raw, config)[4:])
+                    torque = learned_arm(seen, robot, elapsed)
+                    if torque is not None:
+                        raw = np.concatenate([raw[:4], torque])
                 latency = (time.perf_counter() - start)*1000
                 action = clip_action(raw, config)
                 clipped += int(np.any(np.abs(raw - action) > 1e-10))

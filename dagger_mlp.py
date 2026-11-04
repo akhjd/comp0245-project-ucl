@@ -20,7 +20,8 @@ import sys
 import time
 from pathlib import Path
 import numpy as np
-from train_mlp import CASES, OFFSETS, RATE_HZ, Scale, load_policy, state_rows
+from train_mlp import CASES, LIDAR_NAMES, OFFSETS, RATE_HZ, STATE_NAMES, Scale, load_policy, pre_version, state_rows
+from preprocess import FEATURE_SETS, Preprocessor, pose_of
 
 ROOT = Path(__file__).resolve().parent
 CONTACT_LIMIT_S, STALL_LIMIT_S = 2.0, 20.0
@@ -32,16 +33,21 @@ class LearnedWheels:
     def __init__(self, model, saved):
         self.model, self.scale = model, Scale(saved=saved)
         self.frames = collections.deque(maxlen=int(OFFSETS.max()) + 1)
+        names = FEATURE_SETS[pre_version(self.scale.changes["door_memory"])]
+        self.pre = Preprocessor(names) if self.scale.changes["preprocess"] else None        # fed every command, like the saved rows
         self.steps, self.wheels = 0, np.zeros(4)
 
     def __call__(self, state, robot, elapsed):
         if self.steps % CONTROL_EVERY == 0:
             import torch
-            self.frames.append(np.asarray(state["lidar"], np.float32))
-            newest = len(self.frames) - 1
-            lidar = np.concatenate([self.frames[max(newest - k, 0)] for k in OFFSETS])
             rows, _ = state_rows(state["x"][None], np.array([elapsed]), robot.dots, {p["dot"]: p["time_s"] for p in robot.picked})
-            x = (np.concatenate([lidar, rows[0]]) - self.scale.x_mean)/self.scale.x_std
+            if self.pre is not None:
+                lidar = self.pre.step(elapsed, state["lidar"], pose_of(state["x"]), rows[0][7:].reshape(-1, 4))
+            else:
+                self.frames.append(np.asarray(state["lidar"], np.float32))
+                newest = len(self.frames) - 1
+                lidar = np.concatenate([self.frames[max(newest - k, 0)] for k in OFFSETS])
+            x = self.scale.prepare(np.concatenate([lidar, rows[0]])[None])[0]
             with torch.no_grad():
                 self.wheels = self.model(torch.from_numpy(x.astype(np.float32))[None])[0].numpy()*self.scale.y_std + self.scale.y_mean
         self.steps += 1
@@ -120,24 +126,31 @@ def main():
     parser.add_argument("--duration", type=float, default=120.0)
     parser.add_argument("--workers", type=int, default=7)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--cases", nargs="+", default=list(CASES), choices=CASES, help="drive, train and test on these cases only")
     args = parser.parse_args()
     root = Path(args.out)
     root.mkdir(parents=True, exist_ok=True)
-    pool, validation = scenarios_of(args.data, "train"), [s for v in scenarios_of(args.data, "validation").values() for s in v]
+    pool, validation = scenarios_of(args.data, "train"), [s for c, v in scenarios_of(args.data, "validation").items() if c in args.cases for s in v]
+    # A later round trains like the starting model, with the same input changes
+    start = load_policy(args.start)[1]
+    changes = start.get("input_changes", {"no_velocity": len(start["input_names"]) < len(LIDAR_NAMES + STATE_NAMES)})   # older models
+    input_flags = ["--" + k.replace("_", "-") for k, on in changes.items() if on]
+    # ...and the same regularisation and validation checks (older models: none)
+    input_flags += [f"--{k.replace('_', '-')}={v}" for k, v in start.get("training", {}).items()]
     rng = np.random.default_rng(args.seed)
     order = {c: rng.permutation(len(pool[c])) for c in CASES}     # no scenario is driven twice while enough remain
     table = [{"round": 0, "model": args.start, **score(args.start, validation, root/"r0-validation", args.duration, args.workers)}]
     show(0, table[0])
     (root/"results.json").write_text(json.dumps(table, indent=1))
     for k in range(1, args.rounds + 1):
-        chosen = [pool[c][order[c][((k - 1)*args.per_case + i) % len(pool[c])]] for c in CASES for i in range(args.per_case)]
+        chosen = [pool[c][order[c][((k - 1)*args.per_case + i) % len(pool[c])]] for c in args.cases for i in range(args.per_case)]
         begin = time.time()
         drive_all(table[-1]["model"], chosen, root/f"r{k}-data", args.duration, args.workers)
         print(f"ROUND {k}: drove {len(chosen)} runs in {(time.time() - begin)/60:.0f} min", flush=True)
         model_folder = root/f"r{k}"
         if not (model_folder/"result.json").exists():
             shutil.rmtree(model_folder, ignore_errors=True)
-            subprocess.run([sys.executable, str(ROOT/"train_mlp.py"), "--data", args.data, "--out", str(model_folder), "--dagger",
+            subprocess.run([sys.executable, str(ROOT/"train_mlp.py"), "--data", args.data, "--out", str(model_folder), "--cases", *args.cases, *input_flags, "--dagger",
                             *[str(root/f"r{j}-data") for j in range(1, k + 1)]], check=True)
         table.append({"round": k, "model": str(model_folder/"best.pt"),
                       **score(model_folder/"best.pt", validation, root/f"r{k}-validation", args.duration, args.workers)})

@@ -5,11 +5,13 @@
   expert's torque that the network does NOT learn (torque = gravity_torque(q) + network(inputs)).
 - arm_phase_rows(...): picks out the moments where the arm is reaching (the base has parked).
 """
+import json
 from pathlib import Path
 import numpy as np
 import pinocchio as pin
 
-URDF = "/home/akhjd/ros2_ws/RoboEnv/models/summit_xl_arm_description/summit_xl_complete_pin.urdf"
+URDF = str(Path(json.loads((Path(__file__).resolve().parent/"settings.json").read_text())["roboenv_root"])
+           /"models/summit_xl_arm_description/summit_xl_complete_pin.urdf")
 _model = pin.buildModelFromUrdf(URDF)   # fixed-base model: q[0:7] are the arm joints
 _data = _model.createData()
 

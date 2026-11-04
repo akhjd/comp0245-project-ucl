@@ -115,6 +115,23 @@ DECISIONS AND WHY
     Why: requested by the user, and the first model failed from states the expert rarely visits, such as standing still.
     Limit: only the wheels are learned, so the driving scores include expert help with the arm.
 
+25. Train on the expert data only (runs/dataset, no DAgger) with input noise and left-right mirroring. Requested by the user.
+    Noise: each training row gets its own strength, up to 0.05 m lidar, 0.03 m/s speed, 0.1 rad/s yaw rate. Half of each
+    batch is mirrored afresh, so memory use does not grow. Validation stays clean and unmirrored, so results compare with runs/mlp1.
+    Mirror check in the simulator, 3 scenes with mirrored wheel commands: lidar identical at the start; after 1.5 s the median
+    difference was under 1 mm and only 2 of 1620 ray readings differed by over 5 cm, one in each of 2 scenes (likely rays
+    grazing a box corner); robot state within about 2 cm.
+    Limit: these target overfitting. The noise is small, so it may not stop the MLP copying its velocity. To be measured.
+
+26. Train the arm as a separate MLP (train_arm_mlp.py), requested by the user: 24 arm inputs -> 7 torques, added to a physics
+    gravity term, 2 layers of 128, on reaching rows only (527,618 training rows, median reach 2.6 s per dot).
+    Why separate: the base is parked while the arm reaches, so reaching does not need the driving inputs, and each part can be tested alone.
+    Why the gravity term: on joint 1 it explains most of the torque (expert RMSE 23.65 N m, 7.12 N m after removing gravity).
+    Torque limits per joint: 1.25 x the 99.9th percentile of expert reach torques, at most 30 N m: 18.29, 30, 30, 30, 22.98, 30, 26.57.
+    Expert labels and the MLP's torques are clipped to these. They are wide because the expert really does use brief large torques.
+    The simulator's existing 30 N m limit still applies. No expert run or dataset was changed.
+    Driving test: eval_arm_mlp.py. The expert still drives, parks, chooses the dot, decides when to reach, holds and retracts.
+
 RESULTS (collision-free runs that reached the target)
 Experts on the 20 development scenarios (10 moving only, 10 mixed):
   Static SteerAround                   5/20
@@ -243,17 +260,222 @@ Phase 4 - MLP: IN PROGRESS
   - Data collection: DONE.
   - First training: DONE (runs/mlp1).
   - Driving test: written into dagger_mlp.py; first check failed (see above).
-  - Next: run DAgger (python dagger_mlp.py --start runs/mlp1/best.pt --out runs/dagger1) and compare driving per round.
+  - DAgger run runs/dagger1: stopped by the user on 2 Nov during round 1, with 88/150 driving runs done and no DAgger model trained.
+    Round 0 (mlp1 driving, before any DAgger training): 0/82 successes, 1/112 dots; 51 timeouts, 19 crashed, 12 stalled.
 
-TODO (after DAgger finishes)
-  - Lidar and velocity noise: add small random noise to the inputs during training.
-    Why: exact readings are harder to memorise, and the MLP gets used to being slightly off the expert's path.
-    Cost: small code change, one training run.
-  - Mirrored data: flip each scene left to right (lidar order, y positions, left/right wheels).
-    Why: effectively doubles the variety with no new simulation.
-    Cost: small code change, one training run; the flip needs checking carefully.
+Lidar and velocity noise, and mirrored data: IMPLEMENTED in train_mlp.py, not trained yet (see decision 25).
+  Training: python train_mlp.py --out runs/mlp2 --mirror --lidar-noise 0.05 --velocity-noise 0.03 --yaw-rate-noise 0.1
+  Driving test: python dagger_mlp.py --start runs/mlp2/best.pt --out runs/mlp2-drive --rounds 0 --workers 6
+
+MLP without velocity: requested by the user on 2 Nov. Code option added, not trained yet.
+  Removes forward speed, sideways speed and yaw rate from the inputs (199 -> 196). The lidar history may still reveal some motion.
+  Case 1 test: python train_mlp.py --out runs/mlp3-case1 --no-velocity --cases case1
+  Then: python dagger_mlp.py --start runs/mlp3-case1/best.pt --out runs/mlp3-case1-drive --rounds 0 --cases case1 --workers 6
+  DAgger without velocity, chosen by the user: runs/mlp3 trained on all five cases, then DAgger from it in runs/dagger2.
+    Round 0 (mlp3, 196 inputs): 1/82 clean runs, 1/112 dots; 45 stalled, 21 timeouts, 15 crashed. Per case 1/8, 0/20, 0/15, 0/24, 0/15.
+    Round 1: 10/82 clean runs, 11/112 dots; 42 stalled, 18 crashed, 11 timeouts, 11 touched every dot (1 of them with contact).
+    Per case 3/8, 3/20, 1/15, 3/24, 0/15. First real driving progress. Its best training epoch was epoch 1: R2 0.653, then validation worsened while
+    train loss fell to 0.097, so overfitting is real here. Round 2 was in progress when this was written.
+DAgger on mlp1 (runs/dagger1): round 1 got 0/82 clean runs and 1/112 dots, no better than round 0; stopped during round 2 (44/150 driving runs).
+
+Input comparison, chosen by the user on 2 Nov: three input changes, each trained separately and each run through DAgger. All keep velocity out, so the
+  baseline is runs/dagger2. Same validation scenarios and DAgger seed, one DAgger round each, compared with dagger2 round 1 (10/82, 11/112).
+  --no-xy: leaves out x and y (194 inputs). Aim: stop the network memorising places.
+  --dot-polar: each dot as distance, sin and cos of heading, height, still-there flag (199 inputs). Aim: make the goal easier to use.
+  --lidar-features: 180 rays become 30 values: nearest per 30 degree sector, its change over 0.5 s, closest obstacle distance and bearing, free distance
+    towards each dot (46 inputs). Aim: less to overfit. Risk: the change values can reveal speed, and a sector can hide a narrow doorway.
+  Code added to train_mlp.py and dagger_mlp.py; checked on hand-made values, on old model mlp3, and with short simulator drives.
+  Results (runs/compare.log; validation, 82 runs, 112 dots):
+    model           round 0 clean, dots   round 1 clean, dots   round 1 per case (1-5)
+    dagger2 (base)  1/82, 1/112           10/82, 11/112         3/8 3/20 1/15 3/24 0/15
+    no-xy           4/82, 5/112           12/82, 13/112         5/8 3/20 2/15 2/24 0/15
+    dot-polar       13/82, 13/112         20/82, 22/112         7/8 4/20 4/15 5/24 0/15   best
+    lidar-features  8/82, 8/112           16/82, 16/112         7/8 4/20 2/15 3/24 0/15
+  Dot-polar doubled the baseline after one round. No-xy was within chance of the baseline. No model succeeded in case 5 (3 dots).
+  Stalls were still the most common ending (37-51 of 82). Every model, before and after DAgger, had its best validation loss at epoch 1
+  (R2 0.53-0.65) and got worse after, so the networks overfit within the first pass over the data.
+
+Arm MLP: code written and checked, not trained yet.
+  Training: python train_arm_mlp.py --out runs/arm1
+  Driving test: python eval_arm_mlp.py --arm runs/arm1/best.pt --out runs/arm1-drive --workers 6
 
 Optional: sweep obstacle sizes and speeds; Bayesian optimisation of expert and MLP settings.
+
+Data-size test, chosen by the user on 3 Nov: is lack of data causing the overfitting?
+  Question: every training peaks at epoch 1 and then gets worse on validation. Two possible causes, not yet told apart:
+    (a) the expert uses information the MLP does not get (map, A* route, RRT plan, dot order, best of 4 random plans), so similar inputs
+        can have different correct commands, which the network can only memorise; (b) too few truly different examples: rows 10 ms
+        apart are nearly identical, so 5.15 million rows are really about 1,461 runs.
+  Test: same settings as mlp4-polar (no velocity, dot-polar, seed 0), trained on all, half and a quarter of the expert training runs.
+    Validation runs unchanged. The subsets are fixed by scenario id and nested (the quarter is inside the half), with case proportions
+    kept: all 1,461 runs, half 738, quarter 362. The full model is runs/mlp4-polar (best R2 0.600, epoch 1).
+  Reading: much worse validation with less data means (b) matters and more data or regularisation should help. Little change means
+    (a) dominates, and the fix is in the inputs or the expert, not in training settings.
+  Result: best validation R2 0.600 with all runs (epoch 1), 0.487 with half (epoch 2), 0.457 with a quarter (epoch 1, so it peaked after
+    only a quarter of the full model's updates). All three overfit straight after their peak; the half fell to 0.388 by epoch 12 while
+    train loss fell from 0.27 to 0.08.
+  Conclusion: less data clearly hurts, so lack of data is part of the problem, and regularisation or more varied data should help.
+    The step from half to all (+0.11) was bigger than from quarter to half (+0.03), which is unusual for a learning curve. This is one seed and
+    one subset each, so the exact sizes are uncertain. The full model's 0.60 ceiling also leaves room for the other cause (hidden expert
+    information).
+  Code: train_mlp.py --run-fraction.
+    python train_mlp.py --out runs/size-half --no-velocity --dot-polar --run-fraction 0.5
+    python train_mlp.py --out runs/size-quarter --no-velocity --dot-polar --run-fraction 0.25
+
+Regularisation test, chosen by the user on 3 Nov (TODO 1), after the data-size test showed lack of data is part of the problem.
+  New train_mlp.py options: --dropout (after each hidden layer), --weight-decay (switches Adam to AdamW), --evals-per-epoch (validate
+    several times per epoch, so a peak inside epoch 1 is not missed; --patience and --lr-patience then count checks, not epochs).
+    Saved in best.pt as "training"; DAgger retrains later rounds with the same settings. Defaults leave training exactly as before.
+  Runs, all like mlp4-polar (no velocity, dot-polar, all runs, seed 0; best R2 0.600 at epoch 1), each validated 4 times per epoch:
+    reg-checks   no regularisation: shows where the real peak is
+    reg-dropout  dropout 0.2
+    reg-wd       weight decay 0.01
+    reg-both     dropout 0.2, weight decay 0.01, learning rate 3e-4
+  Then the best by validation R2 goes through one DAgger round, to compare with dagger-polar round 1 (20/82, 22/112).
+  Results so far (runs/reg.log):
+    reg-checks: best R2 0.610 at epoch 0.5 (0.603 already at 0.25), then overfit. The peak is inside epoch 1, close to the old 0.600.
+    reg-dropout: best R2 0.688 at epoch 7.75, CONVERGED (no longer overfitting); train 0.188 vs val 0.312. Dropout helps clearly, so the
+      0.60 was not a fixed ceiling from missing information; overfitting was holding it back.
+    reg-wd: best R2 0.611 at epoch 0.5, then overfit: weight decay 0.01 alone made no difference.
+    reg-both (dropout, weight decay, lr 3e-4): best R2 0.696 at epoch 13, CONVERGED; train 0.187 vs val 0.305. Slightly above dropout
+      alone (0.688), which is within noise. The gain comes from dropout, perhaps a little from the lower learning rate.
+  Chosen for the driving test: reg-both (runs/dagger-reg, one DAgger round).
+
+Tests: tests/test_mlp_training.py checks the training options (dropout layers, fractional checks, save and reload, weight decay shrinks
+  weights, DAgger reuses the settings, old models still load). With tests/test_mlp_inputs.py, 13 tests pass.
+  Run: python -m unittest tests.test_mlp_training tests.test_mlp_inputs
+tests/test_mlp_inputs.py checks the input options above (feature values on a hand-made row, input counts, nested run
+  fractions, old model mlp3 unchanged, training and driving inputs equal, short simulator drives). 6 tests pass.
+  Run: python -m unittest tests.test_mlp_inputs
+
+Lidar preprocessing, from the faculty's advice on 3 Nov: preprocess the lidar with fixed maths into features that mean something (walls,
+  doors, moving and static objects, distances), the same code for the expert data and for the MLP while driving. Still imitation: the
+  expert is unchanged and provides every label; only the MLP's inputs change. Features use only the robot's own lidar and pose, never the
+  scenario file. Saved data stays raw, so features can be recomputed without new collection.
+  Plan, chosen by the user on 3 Nov:
+    1. Write preprocess.py: walls (line fitting), doors (gaps the lidar sees through), whether the straight line to each dot is blocked,
+       moving and static objects (clusters tracked in world coordinates). DONE, see below.
+    2. Check the features against the true layouts (walls, doorways and mover positions from the scenario files and saved runs) before
+       any training. DONE, see below.
+    3. Preprocess all runs into a feature cache.
+    4. Train the MLP with dropout 0.2, weight decay 0.01, lr 3e-4; compare R2 with reg-both (0.696).
+    5. One DAgger round and the driving test; compare per case with dagger-reg, especially cases 3-5.
+  Step 1 DONE: preprocess.py. 61 features: 12 sector distances, closest obstacle, nearest wall (distance, bearing, direction),
+    openings (count; nearest: distance, bearing, width, door-like flag), per dot (line blocked, free distance, best-aligned opening),
+    nearest moving object (position, velocity, closest approach), nearest still object. Walls: split-and-merge line fitting. Openings:
+    gaps the lidar sees through, 0.9-2.6 m wide; door-like if both edges are straight and in line with the gap. Objects: small clusters
+    standing in front of their background, tracked in world coordinates using the pose; moving if over 0.08 m/s for 0.8-1 s.
+    Unit tests with a small ray caster: tests/test_preprocess.py, 7 pass.
+  Step 2 DONE: tests/check_preprocess.py on 4 validation runs per case (half with a mover where the case has movers), every 5th row,
+    counting things only when visible (within 3 m, nothing in the way). Results in runs/preprocess_check.json:
+                                     case1   case2   case3   case4   case5
+    wall seen when one is within 3 m 1.00    1.00    1.00    0.99    1.00
+    wall distance error, median m    0.00    0.00    0.02    1.25    0.00    (case 4 not explained yet; small sample)
+    line to dot: agrees with truth   1.00    0.94    0.97    0.95    0.89
+      truly blocked lines caught     -       1.00    1.00    1.00    0.96
+      clear lines called blocked     0.00    0.07    0.03    0.06    0.14
+    visible doorways found           -       -       0.52    0.33    0.60
+      found by a door-like opening   -       -       0.10    0.11    0.21
+    door-like openings at a doorway  -       -       1.00    0.96    0.94
+    openings per row                 0.0     0.6     1.6     3.4     3.0     (most are real gaps between furniture and walls)
+    visible mover found              -       0.88    -       0.33    0.32
+      its speed error, median m/s    -       0.05    -       0.03    0.05
+    false moving reports per row     0.00    0.20    0.43    0.69    0.48
+    time per scan, ms (DAgger running alongside)  0.2 to 1.1
+  Conclusion: walls and the blocked-line check work well. Openings find about half the visible doorways; a door-like flag is almost
+    always right (94-100%) but catches only 10-21%. Mover tracking works in the open room (88%) but not in floor plans: about a third
+    found, and still things (furniture corners, wall ends) reported as moving on 43-69% of rows. Tried: requiring objects to stand in
+    front of their background, and filtering by speed, fit residual and direction consistency; none separated true from false movers
+    (they overlap at 0.1-0.3 m/s). 36 rays are too sparse for reliable tracking among furniture.
+  Steps 3 and 4, code DONE (not run yet):
+    MLP inputs (chosen 3 Nov): preprocess.py's features without mover and still-object tracking (61: 12 sector distances and their
+      change over 0.5 s, closest obstacle, nearest wall, openings, per dot blocked line and best opening), plus x, y, sin and cos yaw,
+      and the dots as distance and heading (15). Velocity left out. 80 inputs. x, y are kept so that only the lidar changes
+      compared with reg-both.
+    build_features.py: preprocesses every run in parallel and caches features_v1.npy next to it (about 1.4 GB for the dataset).
+    train_mlp.py --preprocess: reads the cache (computing any missing file), no raw lidar kept in memory. dagger_mlp.py: the
+      Preprocessor runs on the live lidar every 10 ms, the same rate as the saved rows; DAgger rounds retrain with --preprocess.
+    Tests: tests/test_preprocess_mlp.py (cache written and reused; inputs as chosen; driving path gives the same wheel commands as the
+      training path on a real run, within 1e-4). All 23 MLP and preprocessing tests pass.
+    Command (after dagger-reg): build_features.py, then runs/pre1 with dropout 0.2, weight decay 0.01, lr 3e-4, 4 checks per epoch,
+      then one DAgger round in runs/dagger-pre.
+  dagger-reg (reg-both, R2 0.696) round 0: 14/82 clean, 15/112 dots; per case 1/8, 3/20, 4/15, 6/24, 0/15. About the same as
+    dagger-polar round 0 (13/82), so the better R2 did not clearly improve driving before DAgger.
+  dagger-reg round 1 (150 DAgger runs added, retrained; R2 0.761, CONVERGED at epoch 9.75): 23/82 clean, 23/112 dots; ended 23
+    success, 43 stalled, 9 crashed, 7 timeout; per case 8/8, 7/20, 3/15, 5/24, 0/15. Best model so far (runs/dagger-reg/r1/best.pt),
+    ahead of dagger-polar round 1 (20/82, 22/112). Case 1 solved; cases 3-5 barely changed and case 5 is still 0. Stalls are the
+    main failure. This is now the bar for pre1 (R2 0.761, 23/82).
+  Preprocessing run started 3 Nov 15:15 (the first chained command waited forever because its pgrep matched its own shell).
+    build_features.py (v1): 1625 runs in about 14 min.
+
+DOOR MEMORY (feature set v2, added 3 Nov, user's choice: doorways only)
+  Why: v1 doorway features come from the current scan only. A doorway is often seen clearly only up close, and is lost when
+    the robot turns or backs away; far doorways get 2-3 rays. Remembering a doorway once seen keeps that information.
+  Not a map and still imitation: a short list (at most 6) of doorway positions built only from the robot's own lidar and pose,
+    reset every run. It gives facts, not decisions; training is still regression on the expert's wheel commands. Static
+    obstacles are not remembered: the 360 degree lidar already sees them when they matter, and a mover mistaken for a still
+    obstacle would leave a phantom in memory.
+  How (preprocess.py remember()): each door-like opening (wall, gap, wall in line) is stored in world coordinates; sightings
+    within 0.6 m of a stored doorway are averaged into it, with its wall direction. A doorway is confirmed (given to the MLP)
+    after 3 scans and once a straight piece at least 1.0 m long has been seen beside it in some scan.
+  New inputs (23, v1's 61 unchanged): number remembered; the nearest confirmed doorway (seen, distance, sin, cos, wall direction
+    sin2/cos2, seconds since last seen); per dot the doorway whose wall line has the robot on one side and the dot on the other
+    (else the one with the shortest way robot -> doorway -> dot): seen, distance, sin, cos, across (1/0).
+  Check against the scenario truth (tests/check_door_memory.py, 10 runs per case, cases 3/4/5):
+    rule                      true doorways remembered    remembered that are real   rows with a doorway
+    no wall-length rule       62% / 46% / 77%             80% / 60% / 67%            66% / 47% / 50%
+    longer side >= 1.0 m      54% / 38% / 54%             88% / 100% / 70%           53% / 30% / 43%   <- used
+    longer side >= 1.5 m      54% / 23% / 46%             100% / 100% / 100%         39% / 23% / 29%
+    Position error 5-8 cm (median). "Across" was right 100% of the time when it pointed at a real doorway.
+    False doorways without the rule were gaps between two furniture boxes whose sides line up (looks like wall, gap,
+    wall). Per scan, the longer straight piece beside a real doorway is median 1.41 m, beside a false one 0.80 m.
+    The v1 features are unchanged (largest difference against the cached features_v1.npy: 0.0). About 1 ms per scan.
+  Code: preprocess.py (FEATURE_SETS v1/v2, remember(), confirmed_door()), train_mlp.py --door-memory (needs --preprocess, cache
+    features_v2.npy), dagger_mlp.py (drives and retrains with v2 from the saved model), build_features.py --version v2.
+  Tests: tests/test_door_memory.py (v1 unchanged; remembered after backing out of range; dot behind the wall is across; lined-up
+    furniture is not a doorway; reset forgets) and a v2 train/drive equality test in tests/test_preprocess_mlp.py. All 29 MLP and
+    preprocessing tests pass.
+  Run: after dagger-pre (RAM, 7 GB, does not fit two trainings), runs/pre2 with pre1's settings plus --door-memory, then one
+    DAgger round in runs/dagger-pre2. Compare with pre1 / dagger-pre to see whether the memory helps.
+
+RESULTS, PREPROCESSED LIDAR (3-4 Nov; plan steps 4 and 5)
+  model                              expert-only R2   round 0   round 1 (R2 after retrain)   round 1 by case 1/2/3/4/5
+  dagger-reg (raw lidar, before)     0.696            14/82     23/82, 23/112 dots (0.761)   8/8, 7/20, 3/15, 5/24, 0/15
+  dagger-pre (v1 features)           0.634            22/82     39/82, 39/112 dots (0.705)   7/8, 10/20, 10/15, 12/24, 0/15
+  dagger-pre2 (v1 + door memory)     0.618            16/82     26/82, 27/112 dots (0.709)   8/8, 9/20, 2/15, 7/24, 0/15
+  dagger-pre round 0 by case: 0/8, 1/20, 8/15, 13/24, 0/15; ended 22 success, 30 stalled, 18 timeout, 12 crashed.
+  dagger-pre round 1 ended: 39 success, 30 stalled, 10 crashed, 3 timeout.
+  - Preprocessing works: successes 23 -> 39 of 82 after one DAgger round, and the cases with floor plans gained most
+    (case 3: 3 -> 10 of 15, case 4: 5 -> 12 of 24). This supports the faculty's advice to preprocess the lidar.
+  - Validation R2 does not predict driving: pre1 had a lower R2 than reg-both (0.634 vs 0.696) but drove far better. The
+    driving test, not R2, is the measure used to choose models.
+  - The door memory did not help (26/82 vs 39/82, cases 3-4 worse). Likely cause: remembered doorways that are false (up to
+    30%) or that the current scan contradicts, pulling the robot towards a stale gap; not tested further. Each model was trained
+    once (one seed), but the gap is large.
+  - Still open: case 5 (3 dots) is 0/15 in every model; stalls (30 of 82) are the most common ending.
+  Main model: runs/dagger-pre/r1/best.pt. Next: DAgger rounds 2 and 3 for dagger-pre (started 4 Nov, about 2-2.5 h per round).
+  Time limit: steps 1-5 by the end of 5 Nov. If the features do not help by then, report them as an attempt with their measured
+    accuracy and submit dagger-reg as the main model.
+  Known limit: 36 rays 10 degrees apart reach 4 m, so at 3 m neighbouring rays are about 0.5 m apart. A doorway 4 m away gets 2-3 rays
+    and a cylinder may get one, so features are expected to be good close up and poor at range.
+
+TODO (added 3 Nov, after the input comparison; not started)
+1. Fix overfitting within the first epoch: weight decay and dropout, a lower learning rate, and checking validation several times per epoch
+   so the best point is not missed. All 8 trainings so far had their best validation loss at epoch 1.
+2. Combine dot-polar and lidar-features in one model, velocity still out. Train it with the fix from 1, then 2-3 DAgger rounds.
+   Compare with dagger-polar round 1 (20/82, 22/112).
+3. Case 5 (3 dots) is 0/15 in every model: compare the order the MLP visits dots with the expert's. If dot choice is the problem, try a
+   current-target input. That changes the user's chosen dot inputs, so it needs the user's approval.
+4. Stalls are still the most common ending (37-51 of 82): look at where stalled runs stop and what the MLP commands there.
+5. dagger2 was stopped during round 2 and can be resumed:
+   python dagger_mlp.py --start runs/mlp3/best.pt --out runs/dagger2 --workers 6
+6. (added 4 Nov) Diagnose case 5 (0/15 in every model): read the 15 case 5 runs in runs/dagger-pre/r3-validation (no training):
+   where each run goes, which dot it heads for first, how it ends, and the expert's order for the same scenarios. If dot
+   choice is the cause, options (need the user's approval): a current-dot input, or an expert order the MLP can infer
+   (such as nearest reachable first, which means collecting case 5 again).
+7. (added 4 Nov) Optional: a 4th DAgger round for dagger-pre (gains were +17, +7, +2), and a repeat validation drive to measure
+   noise between drives:
+   python dagger_mlp.py --start runs/pre1/best.pt --out runs/dagger-pre --workers 6 --rounds 4
 
 NOTES
 - Scenario files: scenarios_obstacles_moving_only.json, scenarios_obstacles_moving_mixed.json,
@@ -264,3 +486,55 @@ NOTES
   best.pt, metrics.csv, curves.png, result.json.
 - Example: python collect_obstacles.py --scenarios scenarios_obstacles_moving_mixed.json
   --out runs/demo1 --only trainmx_003 --room 5 --rrt --duration 60 --gui
+
+
+
+
+
+preprocess data before feeding to MLP - recollect data.
+
+RESULTS, MORE DAGGER ROUNDS FOR dagger-pre (4 Nov)
+  Same folder and start model (runs/pre1/best.pt), --rounds 3: rounds 0-1 were reused, rounds 2 and 3 added 150 MLP-driven runs
+  each (expert labels); each retrain uses all DAgger data so far. About 1 h 45 min per round.
+  Validation data (82 runs, never trained on; the test split is still unused):
+    case   room                                                  obstacles                                  dots   runs
+    1      open 8 x 8 m room, outer walls only                   none                                       1      8
+    2      open 8 x 8 m room                                     static and moving cylinders                1      20
+    3      random floor plan: 1-2 interior walls with a 1.4 m    no cylinders (walls and furniture only)    1      15
+           doorway each, 2-4 furniture boxes
+    4      random floor plan, as case 3                          static and moving cylinders (at least 1)   1      24
+    5      random floor plan, as case 3                          static and moving cylinders (at least 1)   3      15
+  round   R2 after retrain   clean successes   dots touched   ended                                        case 1/2/3/4/5 clean
+  0       0.634 (pre1)       22/82             22/112         22 success, 30 stalled, 18 timeout, 12 crashed   0/8, 1/20, 8/15, 13/24, 0/15
+  1       0.705              39/82             39/112         39 success, 30 stalled, 3 timeout, 10 crashed    7/8, 10/20, 10/15, 12/24, 0/15
+  2       0.724              46/82             51/112         47 success, 27 stalled, 3 timeout, 5 crashed     8/8, 8/20, 12/15, 18/24, 0/15
+  3       0.729              48/82             52/112         52 success, 25 stalled, 3 timeout, 2 crashed     8/8, 14/20, 13/15, 13/24, 0/15
+  ("Clean" = every dot touched with no contact; "dots touched" also counts runs with contact.)
+  - Main model now: runs/dagger-pre/r3/best.pt, 48/82 (vs 23/82 for raw lidar after one round). Cases 1-4: 48/67 (72%).
+  - Gains are slowing: +17, +7, +2 clean successes per round. Crashes fell steadily (12 -> 2).
+  - Case 4 dropped from 18/24 in round 2 to 13/24 in round 3 while case 2 rose 8 -> 14: rounds trade cases, so a single
+    validation drive per round has noticeable noise.
+  - Case 5 (3 dots) is 0/15 in every round; it touched 4 of 45 dots in round 2 and 0 in round 3. The robot rarely reaches even
+    its first dot. Suspected cause: the expert chooses the visiting order (rooms first, by A*), which the MLP cannot see, so it
+    averages between dots and does not commit. Not yet diagnosed.
+  - Stalls (25 of 82) remain the most common failure.
+  Next: diagnose case 5 from runs/dagger-pre/r3-validation (where each run goes, which dot it heads for, how it ends). Removing
+  case 5 or the floor-plan cases from the results was considered and rejected: the floor-plan cases are where preprocessing
+  helped most, and case 5 is reported as a failure with its cause.
+
+TOOLS FOR WATCHING THE MLP (4 Nov)
+  drive_mlp.py: drives the MLP (inference only, no training or labels) on chosen scenarios, with --gui for the PyBullet
+    window: by case (--case case3 case4), --static-only (no moving cylinder), --id, --split, or --scenario-file.
+  interactive_test.py: a click-to-build editor (matplotlib) for interactive testing: random or loaded floor plan, place
+    the robot and its heading, up to 3 dots, still and moving cylinders; checks the robot and parking spots are clear and a
+    route exists, then runs the MLP (drive_mlp.py) or the RRT expert (collect_obstacles.py --rrt) in the PyBullet GUI and
+    shows the result. Scenarios are saved in runs/interactive/.
+  eval_mlp.py (4 Nov, after the user's GUI tests failed where validation said 13/15): a larger driving test. Driving is
+    deterministic (case4_0189 driven again gave the same run, success at 32.0 s, as in round 3 validation), so repeats add
+    nothing; the test uses many fresh scenarios drawn like the dataset (make_dataset.make) with a new seed, never trained or
+    validated on, optionally the test split, and optionally the RRT expert on the same scenarios. Results by case, still vs
+    moving cylinders, same room vs needing a doorway, each with a 95% Wilson range (15 runs give wide ranges: 13/15 = 62-96%).
+  User's GUI tests: the two interactive runs used hand-placed starts outside the dataset's start rules (0.62 m from the outer
+    wall, facing it); the saved one scraped the wall and then stalled in front of the dividing wall, where v1's per-dot opening
+    (closest angle to the dot) pointed at a gap on the robot's side of the wall instead of the doorway. A shortest-trip rule
+    would pick the same wrong gap; rejecting gaps whose line to the dot crosses a seen wall would not. Not yet changed.
