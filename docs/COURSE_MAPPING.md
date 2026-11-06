@@ -85,6 +85,15 @@ Course slide sets used below:
 
 ---
 
+## 8. Arm design notes
+
+| Choice | Course link | Report wording / citation |
+|---|---|---|
+| Physics for the known part, learning for the rest: torque = gravity_torque(q) + network | Brief asks the model to output torques; K-2a / K-3a kinematics and dynamics | The learned torque mapping only holds for poses like those in training. Model-based inverse dynamics would handle new poses exactly, so the remaining limit has a non-ML fix. Trade-off: more built-in code, which the faculty prefer to avoid. External: residual learning; check a citation before use |
+| Goal arm pose rejected (future work) | K-3a inverse kinematics; redundancy: 7 joints reaching a 3D point | Solve one good final pose and steer to it. It would respect joint limits, but a PD controller could then do the job without a network, the expert's data does not head for that pose, and our misses are not at joint limits. Evidence: the final arm's 3 failures in 40 had no joint at a limit and got within 1.2-2.1 cm |
+
+---
+
 ## Course topics we have NOT used yet (possible quick extra experiments)
 
 1. **Bayesian optimisation (W3-1).** Tune hyperparameters (hidden size, learning rate, data stride) or the

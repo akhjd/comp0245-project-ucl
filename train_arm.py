@@ -1,4 +1,5 @@
 """Train the learned arm (model A): 24 arm inputs -> 7 joint torques, on top of the gravity term.
+--ik trains model B instead: the same 24 inputs + 7 ik_direction joint speeds (arm_data.arm_inputs_b) = 31.
 
     torque = gravity_torque(q) + network(arm_inputs)
 
@@ -13,6 +14,7 @@ The saved weights are those of the epoch with the lowest validation loss (early 
 
 Example:
     python train_arm.py --data runs/obst-v4-height runs/obst-v4-armstart runs/obst-v4-both --out runs/arm-a
+    python train_arm.py --data runs/obst-v4-height runs/obst-v4-armstart runs/obst-v4-both --ik --out runs/arm-model-b
 """
 import argparse
 import json
@@ -21,7 +23,7 @@ import numpy as np
 import torch
 from torch import nn
 from models import arm_inputs, ARM_INPUT_NAMES
-from arm_data import gravity_torque, arm_phase_rows
+from arm_data import gravity_torque, arm_phase_rows, arm_inputs_b, ARM_B_INPUT_NAMES
 
 STRIDE = 10     # keep every 10th row: neighbouring 1 ms rows are near-copies
 HIDDEN = 64
@@ -30,8 +32,8 @@ BATCH = 256
 LR = 1e-3
 
 
-def load(folders, validation, label="actions"):
-    """Reaching rows -> inputs (rows, 24) and torque targets (rows, 7).
+def load(folders, validation, label="actions", inputs=arm_inputs):
+    """Reaching rows -> inputs (rows, 24, or 31 for model B) and torque targets (rows, 7).
     label "actions": expert datasets; successful episodes only; validation=False: the training episodes, True:
     every 10th episode (held out). label "expert_arm": DAgger folders; every episode, training only."""
     xs, ys = [], []
@@ -54,23 +56,24 @@ def load(folders, validation, label="actions"):
             torque = z["actions"][rows, 4:11] if label == "actions" else z["expert_arm"][rows]
             q = obs[:, 8:15]                           # the 7 joint angles
             gravity = np.array([gravity_torque(angles) for angles in q])     # (rows, 7)
-            x = np.array([arm_inputs(o, e) for o, e in zip(obs, ee)])   # TODO 1: arm_inputs for every row -> (rows, 24)
+            x = np.array([inputs(o, e) for o, e in zip(obs, ee)])   # arm inputs for every row -> (rows, 24 or 31)
             y = torque - gravity   # TODO 2: torque minus gravity_torque(q) for every row -> (rows, 7)
             xs.append(x)
             ys.append(y)
     return np.concatenate(xs).astype(np.float32), np.concatenate(ys).astype(np.float32)
 
 
-def train(data, out, epochs=EPOCHS, seed=0, dagger=()):
+def train(data, out, epochs=EPOCHS, seed=0, dagger=(), ik=False):
     out = Path(out)
     if out.exists():
         raise FileExistsError(f"Choose a new output folder: {out}")
     torch.manual_seed(seed)
-    x, y = load(data, validation=False)
+    inputs, names = (arm_inputs_b, ARM_B_INPUT_NAMES) if ik else (arm_inputs, ARM_INPUT_NAMES)
+    x, y = load(data, validation=False, inputs=inputs)
     if dagger:
-        xd, yd = load(dagger, validation=False, label="expert_arm")
+        xd, yd = load(dagger, validation=False, label="expert_arm", inputs=inputs)
         x, y = np.concatenate([x, xd]), np.concatenate([y, yd])
-    xv, yv = load(data, validation=True)
+    xv, yv = load(data, validation=True, inputs=inputs)
     print(f"train rows {len(x)} ({len(dagger)} DAgger folders), validation rows {len(xv)}, inputs {x.shape[1]}")
 
     # Scaling: learnt on TRAIN only
@@ -80,7 +83,7 @@ def train(data, out, epochs=EPOCHS, seed=0, dagger=()):
     XV, YV = torch.tensor((xv - x_mean)/x_std), torch.tensor((yv - y_mean)/y_std)
 
     model = nn.Sequential(
-        nn.Linear(len(ARM_INPUT_NAMES), HIDDEN),
+        nn.Linear(len(names), HIDDEN),
         nn.ReLU(),
         nn.Linear(HIDDEN, HIDDEN),
         nn.ReLU(),
@@ -117,11 +120,11 @@ def train(data, out, epochs=EPOCHS, seed=0, dagger=()):
     print(f"validation torque RMSE per joint (N m): {np.round(rmse, 2)} (best epoch {best_epoch})")
 
     out.mkdir(parents=True)
-    torch.save({"state_dict": model.state_dict(), "hidden": HIDDEN, "input_names": ARM_INPUT_NAMES,
+    torch.save({"state_dict": model.state_dict(), "hidden": HIDDEN, "input_names": names,
                 "x_mean": x_mean, "x_std": x_std, "y_mean": y_mean, "y_std": y_std}, out/"model.pt")
     (out/"training.json").write_text(json.dumps({"validation_rmse_per_joint_n_m": rmse.round(4).tolist(),
         "best_epoch": best_epoch, "train_rows": len(x), "validation_rows": len(xv), "epochs": epochs,
-        "stride": STRIDE, "seed": seed, "data": [str(f) for f in data], "dagger": [str(f) for f in dagger]}, indent=1))
+        "stride": STRIDE, "seed": seed, "inputs": len(names), "data": [str(f) for f in data], "dagger": [str(f) for f in dagger]}, indent=1))
     print(f"saved {out/'model.pt'}")
 
 
@@ -132,8 +135,9 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ik", action="store_true", help="model B: add the 7 ik_direction inputs")
     args = parser.parse_args()
-    train(args.data, args.out, args.epochs, args.seed, args.dagger)
+    train(args.data, args.out, args.epochs, args.seed, args.dagger, args.ik)
 
 
 if __name__ == "__main__":

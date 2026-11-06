@@ -10,6 +10,9 @@ Examples:
     python demo.py full
     python demo.py base --scenario validationd_005
     python demo.py full --file scenarios_obstacles_hard2_gate.json --scenario validationhard2g_000
+    python demo.py full --file scenarios_obstacles_val_e.json --scenario validatione_000 --push 120
+Adversities: --lidar-noise/--lidar-dropout, --push, --delay (same seed and push side as robust_full.py).
+Demo picks with known outcomes: DEMO.md.
 Each run is saved in runs/demo/ (its inference_ms includes the real-time waiting, so do not use it for timing).
 """
 import argparse
@@ -50,8 +53,13 @@ def main():
     parser.add_argument("--base", default=BASE, help="learned base model.pt")
     parser.add_argument("--arm", default=ARM, help="learned arm model.pt")
     parser.add_argument("--speed", type=float, default=1.0, help="x real time; 0 = as fast as possible")
-    parser.add_argument("--duration", type=float, default=40.0)
+    parser.add_argument("--duration", type=float, default=70.0)
     parser.add_argument("--headless", action="store_true", help="no viewer (for testing)")
+    # Adversities, as in robustness.py / robust_full.py (same random seed and push side for the same scenario)
+    parser.add_argument("--lidar-noise", type=float, default=0.0, help="m, Gaussian per ray (with --lidar-dropout)")
+    parser.add_argument("--lidar-dropout", type=float, default=0.0, help="chance a ray reports nothing")
+    parser.add_argument("--push", type=float, default=0.0, help="N sideways for 0.3 s at t = 6 s")
+    parser.add_argument("--delay", type=float, default=0.0, help="ms: wheel commands reach the motors late")
     args = parser.parse_args()
 
     from eval_arm import LearnedArm, load_arm
@@ -59,7 +67,8 @@ def main():
     from obstacle_env import rollout
     from pipeline import read_json
     scenarios = json.loads((ROOT/args.file).read_text())
-    scenario = next(s for s in scenarios if s["id"] == args.scenario) if args.scenario else scenarios[0]
+    index = next(i for i, s in enumerate(scenarios) if s["id"] == args.scenario) if args.scenario else 0
+    scenario = scenarios[index]
     if scenario["split"] == "test":
         raise ValueError("The test split is reserved for the final evaluation")
     config = read_json(ROOT/"settings.json")
@@ -76,7 +85,12 @@ def main():
         policy = Paced(policy, args.speed)
     folder = ROOT/"runs"/"demo"/f"{args.mode}-{scenario['id']}-{datetime.now():%H%M%S}"
     print(f"{args.mode}: {scenario['id']} ({len(scenario['obstacles'])} obstacles), target {scenario['target']}")
-    summary = rollout(config, scenario, folder, policy, gui=not args.headless)
+    perturb = {k: v for k, v in {"lidar_noise": args.lidar_noise, "lidar_dropout": args.lidar_dropout,
+                                 "push_n": args.push, "delay_ms": args.delay}.items() if v}
+    if perturb:
+        perturb.update(seed=index, push_sign=1 if index % 2 == 0 else -1)
+        print("adversity:", perturb)
+    summary = rollout(config, scenario, folder, policy, gui=not args.headless, perturb=perturb or None)
 
     print(f"ended: {summary['termination']} after {summary['simulation_time_s']:.1f} s, contact steps "
           f"{summary['contact_steps']}, final hand error {summary['final_error_m']*1000:.0f} mm")

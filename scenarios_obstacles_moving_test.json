@@ -1,0 +1,6 @@
+[
+  {"id": "moving_cross_000", "split": "train", "start": [0.0, 0.0, 0.0], "target": [3.5, 0.0, 0.7],
+   "park": [2.6, 0.0],
+   "obstacles": [{"xy": [1.5, -1.2], "r": 0.25, "vel": [0.0, 0.2], "span": 3.0}],
+   "seed": 1}
+]

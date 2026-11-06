@@ -1,0 +1,105 @@
+% Results section, draft of 5 Nov 2026 (Claude). Every number comes from a saved run; the folder is in the comment
+% next to it. Validation = the 60 rooms of scenarios_rooms_val.json, test = the 80 rooms of scenarios_rooms_test.json
+% (run once, on 5 Nov, after every choice was made). Needs \usepackage{booktabs} or swap \toprule etc. for \hline.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Metrics}
+The base is scored as \emph{parked} when, for the whole of the last \SI{2}{s} of the episode, it stands where the
+arm can reach the target (horizontal distance from \SI{0.3}{m} up to 84.9\% of the straight arm's reach when facing
+the target, falling linearly to 83\% at the \SI{30}{\degree} facing limit; both edges were measured with the expert
+arm), faces the target within \SI{30}{\degree}, is stopped (below \SI{0.02}{m/s} and \SI{0.05}{rad/s}) and has had no
+contact in the whole run. A mover that hits a parked robot also counts as a failure. We report mover hits separately,
+because they were the main failure throughout. The full robot uses the course rule: the hand stays within \SI{1}{cm}
+of the target for \SI{0.25}{s}, with no contact in the whole run. Base runs last \SI{70}{s}; full-robot runs last
+\SI{100}{s}, which allows for the unfolding and the reach.
+
+\subsection{Learning the room base}
+Table~\ref{tab:progression} follows the room base through the changes that were kept. Each row is the third DAgger
+round~\cite{ross2011dagger} unless marked otherwise. With the visible-only RRT teacher, removing the velocity inputs
+raised parking from 4 to 9 rooms; with them the network copied its own motion (the copycat problem~\cite{wen2020copycat}).
+A small learned 1-D convolution over the lidar rays (circular, shared across directions) raised parking to 16, and the threat head (an auxiliary output predicting
+the nearest mover's position and velocity) lowered mover hits to 30. The largest gains came from changing what the
+network learns from: the dynamic-window teacher, which the network could copy far better than the RRT (copy $R^2$ 0.46
+against 0.06 on the same rooms), and folding the arm inside the base outline while driving. The old arm pose reached
+\SI{0.73}{m} ahead below the obstacle tops, where movers struck it. DAgger rounds that added crossing-mover scenes cut
+mover hits from 16 to 12. A small learned ``hold still'' head on the frozen network, latched once it has been on for
+\SI{0.5}{s}, stops the slow creeping that failed the stillness check. The final room base has 10.9k parameters.
+
+\begin{table}[t]
+\centering
+\caption{Room base on the 60 validation rooms (parked; runs with a mover contact).}
+\label{tab:progression}
+\begin{tabular}{lcc}
+\toprule
+Model (DAgger round 3 unless noted) & Parked & Mover hits \\
+\midrule
+Visible-only RRT teacher, velocity inputs, 1 scan         & 4  & 45 \\ % dagger-rooms-velocity/r3
+\quad no velocity inputs                           & 9  & 37 \\ % dagger-rooms-1scan/r3
+\quad 3 scans                                      & 7  & 36 \\ % dagger-rooms-3scans/r3
+\quad + ray convolution                            & 16 & 35 \\ % dagger-rooms-conv/r3
+\quad + threat head                                & 15 & 30 \\ % dagger-rooms-conv-threat/r3
+Window teacher, 72 rays                            & 21 & 23 \\ % dagger-rooms-window72b/r3
+\quad arm folded while driving (no retraining)     & 31 & 16 \\ % window-fold-r0-start/validation
+\quad + crossing-mover DAgger                      & 35 & 12 \\ % dagger-rooms-crossing/r3
+\quad + latched hold head (\textbf{final})         & \textbf{37} & \textbf{12} \\ % crossing-hold/r3-hold-latch-validation
+\midrule
+Second seed: crossing DAgger / + hold              & 32 / 31 & 13 / 13 \\ % dagger-rooms-crossing-s1/r3, crossing-hold/s1-r3-hold-latch-validation
+600 more rooms + mirror augmentation, 2 seeds      & 28, 36 & 15, 15 \\ % dagger-rooms-big-s0/-s1 r3
+Teacher (window expert)                            & 50 & 4 \\ % rooms-window72-val
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Run-to-run noise.} Two seeds of the same crossing DAgger disagree on 19 of the 60 rooms, so differences of
+2--4 parked rooms are within noise. The drop in mover hits (16 to 12--13) and the better copying just before past
+mover hits (turn correlation 0.21 to 0.53--0.55) repeated on both seeds. The parking gain from the crossing DAgger and
+the hold head did not repeat clearly; the hold head stayed in the final model because the rule we wrote before the run
+selected it. Several ideas were tried and not kept because they failed rules written before the results: a mixture
+output and a menu of discrete actions (no better copying in the states before hits), a learned evade/target switch,
+a larger network (copying on new rooms did not improve: 0.65 / 0.70 / 0.66 for 64 / 128 / 256 units), a fourth DAgger
+round (35 parked, 14 mover hits), and four times more training rooms with left--right mirror augmentation (mover
+hits rose to 15 on both seeds).
+
+\subsection{Final test}
+The test rooms were used once, after the base, the arm and every evaluation setting were fixed
+(Table~\ref{tab:test}). Both results agree with validation within noise, so the choices made on validation did not
+overfit noticeably.
+
+\begin{table}[t]
+\centering
+\caption{Final models on the validation and test rooms.}
+\label{tab:test}
+\begin{tabular}{lcc}
+\toprule
+ & Validation (60) & Test (80) \\
+\midrule
+Base parked                            & 37 (62\%) & 48 (60\%) \\ % crossing-hold/r3-hold-latch-validation; final-test/base
+Base: runs with a mover hit            & 12 (20\%) & 18 (23\%) \\
+Full robot success                     & 32 (53\%) & 45 (56\%) \\ % arm-eval-rooms-full-val; arm-eval-final-test
+Arm success after a clean hand-off     & 32/38 (84\%) & 45/60 (75\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For the full robot, the arm starts only once the base passes the parking rule for \SI{2}{s}. The folded arm first
+moves along a straight joint-space path to its usual start pose (about \SI{7}{s}); the learned arm then reaches in a
+median of \SI{2.8}{s}. Of the 35 test failures, 16 were mover contacts while driving (10 of these robots still parked
+afterwards), 4 never passed the parking rule and 1 parked too late to reach. The other 14 were arm misses without
+contact: in 12 the hand came within 1.0--\SI{3.5}{cm} but did not stay within \SI{1}{cm}. The same two failure types
+dominate validation, where unfolding caused a single contact.
+
+\subsection{Open floor and compute}
+On the open-floor task with static obstacles (40 held-out scenarios), the learned robot (a 7k-parameter base
+and a 6.2k-parameter arm) succeeds in 37 of 40 with no contact; the expert succeeds in 40 of 40, as does expert
+driving with the learned arm. % arm-eval-final, -hybrid, -expert
+Both networks run on one CPU thread (AMD Ryzen 7 5800X3D): the room base takes \SI{178}{\micro s} per step
+and the arm \SI{49}{\micro s}, well inside the \SI{1}{ms} control period. % scratchpad efficiency check, 5 Nov
+
+\subsection{Limitations}
+The teacher is privileged: it knows the map of walls and still obstacles, and for every mover a lidar ray hit in the
+last second it uses the mover's true position and velocity. The network sees only lidar and its own state, so part of
+the gap to the teacher (50 against 37 parked) is information the network does not have. Most comparisons use
+a single seed, and the noise above limits what they can show. Mover contacts while driving remain the main loss,
+followed by the arm's last centimetre.

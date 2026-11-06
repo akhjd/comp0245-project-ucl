@@ -90,6 +90,7 @@ def main():
     parser.add_argument("--base", help="learned base model.pt that parks (default: the expert's wheels)")
     parser.add_argument("--init-model", help="round 0 = this arm model.pt (copied, not retrained)")
     parser.add_argument("--init-dagger", nargs="*", default=[], help="earlier arm DAgger folders to keep training on")
+    parser.add_argument("--ik", action="store_true", help="model B: train with the 7 ik_direction inputs")
     parser.add_argument("--resume", action="store_true",
                         help="continue an existing run to more --rounds (finished rounds are kept, not redone)")
     args = parser.parse_args()
@@ -119,7 +120,7 @@ def main():
             shutil.copy(args.init_model, root/"r0"/"model.pt")
             (root/"r0"/"training.json").write_text(json.dumps({"copied_from": args.init_model}, indent=1))
         else:
-            train(args.data, root/f"r{k}", seed=args.seed, dagger=dagger_dirs)
+            train(args.data, root/f"r{k}", seed=args.seed, dagger=dagger_dirs, ik=args.ik)
         model = str(root/f"r{k}"/"model.pt")
         row = {"round": k, "dagger_folders": len(dagger_dirs)}
         if args.base:     # fully learned first (the round is chosen on it), then expert parking
@@ -132,7 +133,7 @@ def main():
         table.append(row)
         print(f"ROUND {k}: {row}", flush=True)
         (root/"results.json").write_text(json.dumps({"data": args.data, "base": args.base or "expert wheels",
-                                                     "init_model": args.init_model, "init_dagger": args.init_dagger,
+                                                     "init_model": args.init_model, "init_dagger": args.init_dagger, "ik": args.ik,
                                                      "rounds": table}, indent=1))
 
 
