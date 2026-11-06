@@ -69,7 +69,7 @@ Sources: AGENT_LOG.md (full detail and numbers) and runs/ / archive/runs/ (the e
 
 ### 9. Early stopping
 - **Seen:** best validation loss at epoch 19, but epoch 30's weights were saved.
-- **Fix:** train_base_torch.py now keeps the best-validation epoch.
+- **Fix:** comp0245/training/train_base_torch.py now keeps the best-validation epoch.
 
 ---
 
@@ -180,7 +180,7 @@ Sources: AGENT_LOG.md (full detail and numbers) and runs/ / archive/runs/ (the e
 - **Fix (29 Oct):** strict/loose now have to hold for the last 2 s (distance, facing, speed and yaw rate); wheels
   get zero until the first delayed command arrives, and `applied_actions` is saved; a new `expert_hold`
   reference uses the expert's wheels with the same arm hold and episode length; `map_location="cpu"` plus an
-  input-name check. Old runs re-scored without re-simulating (`rescore.py`, written to `rescored.json`; originals kept).
+  input-name check. Old runs re-scored without re-simulating (`comp0245/evaluation/rescore.py`, written to `rescored.json`; originals kept).
 - **What it changed:** the clean-trained no-velocity model had looked perfectly robust to lidar noise (30/30
   loose); with the 2 s check it is 19/30 at the strongest noise, because it keeps twitching after parking.
 - **Lesson:** a metric that samples one moment can be passed by behaviour you would never accept. A reference

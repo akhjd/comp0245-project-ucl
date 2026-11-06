@@ -10,4 +10,4 @@ These are project recommendations, not imposed numerical assignment criteria.
 
 `docs/dependencies.md` records external checkout revisions at snapshot time. Both checkouts had local modifications: revisions alone do not reproduce the environment. Preserve/review those changes before claiming a fresh clone reproduces results.
 
-Known limitations: legacy documentation predates several experimental changes; arm_data.py contains a workstation-specific URDF path; experimental evaluators may contain run-specific defaults. Update these before moving machines. No final model performance is claimed by this repository setup.
+Known limitations: legacy documentation predates several experimental changes; comp0245/arm_data.py contains a workstation-specific URDF path; experimental evaluators may contain run-specific defaults. Update these before moving machines. No final model performance is claimed by this repository setup.

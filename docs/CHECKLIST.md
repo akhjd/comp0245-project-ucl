@@ -12,12 +12,12 @@ Julia's `rrt-expert` work (00984f1) is merged locally, not on GitHub main yet: e
 - [x] Learned base: lidar + target, noise-robust DAgger with hard layouts (weights/base_final.pt)
 - [x] Learned arm: gravity + network, DAgger with a shadow expert, then with the learned base parking (weights/arm_final.pt)
 - [x] Fully learned robot on fresh validation: 37/40, no collisions (expert 40/40)
-- [x] Live demo (demo.py) and browser replays (view_runs.py, runs/viewers.html)
+- [x] Live demo (comp0245/apps/demo.py) and browser replays (comp0245/apps/view_runs.py, runs/viewers.html)
 - [x] GitHub repo updated 29 Oct (newer local work not pushed yet: see section 5)
 
 ## 2. Model B: IK direction as extra arm inputs (handed to Claude 3 Nov)
-- [x] `ik_direction` in arm_data.py + tests (21 of 21 pass)
-- [x] Arm inputs 24 -> 31 (arm_data.arm_inputs_b, `train_arm.py --ik`), trained on the same data (runs/arm-model-b)
+- [x] `ik_direction` in comp0245/arm_data.py + tests (21 of 21 pass)
+- [x] Arm inputs 24 -> 31 (arm_data.arm_inputs_b, `comp0245/training/train_arm.py --ik`), trained on the same data (runs/arm-model-b)
 - [x] Compare A vs B (runs/arm-eval-model-b): B 42/90 against A 62/90, so A stays. 32 of B's 48 misses got within 3 cm and then moved away
 - [x] Arm DAgger for B anyway (Akhilesh: to be sure; runs/dagger-arm-modelb): 42, 64, 76, 76, 79, **88**/90 (A's run: 62 ... 84; final arm 87)
 - [x] B's second stage (runs/dagger-arm-modelb-lb): 69/90 fully learned (final arm 77), val_d 37/40 fully learned, 38/40 expert base (final arm 37 / 40). B does not beat it: arm_final stays
@@ -56,10 +56,10 @@ Each needs: environment change, expert that still solves it, new data, retrainin
 
 ## 4. Evaluation (after the design is frozen)
 - [x] **Base metric "parked"** (3 Nov, Akhilesh): reach area (measured, runs/reach-area-fine) + facing +-30 deg + still 2 s + no contact; strict/loose no longer reported. All room runs, the room expert and robust-hard-r3 rescored (rescored.json; originals kept; log runs/rescore-parked-3nov.log)
-- [ ] Rescore runs that finish later (mix r3, steady r2-r3) with `python rescore.py FOLDER`
+- [ ] Rescore runs that finish later (mix r3, steady r2-r3) with `python -m comp0245.evaluation.rescore FOLDER`
 - [ ] Arm: retrain/DAgger with parking from the learned base and spots spread over the reach area (decided 3 Nov)
 - [x] Full robot under adversities (30 Oct, runs/robust-full): clean 37/40, lidar 38, push 35 (expert 35), delay 38, hard 22/30; all contacts while driving. Redo the arm part if model B replaces the arm
-- [ ] **Noise and robustness on the new room model** (Akhilesh, 3 Nov): once the model is picked, lidar noise/dropout, push and delay tests (robust_full.py style) in rooms; noise-robust training if needed (noisy_copy must handle 3 scans and 72 rays first)
+- [ ] **Noise and robustness on the new room model** (Akhilesh, 3 Nov): once the model is picked, lidar noise/dropout, push and delay tests (comp0245/evaluation/robust_full.py style) in rooms; noise-robust training if needed (noisy_copy must handle 3 scans and 72 rays first)
 - [ ] Bigger test set: generate it BEFORE any test run (current obstacle test split has only 10 scenarios)
 - [ ] One final test evaluation: fully learned, expert wheels + arm, full-task expert
 - [x] Efficiency (runs/efficiency.json): 7.2k + 6.2k parameters, ~30 kB each, act() median 0.12 ms per 1 ms step
@@ -71,9 +71,9 @@ Each needs: environment change, expert that still solves it, new data, retrainin
 - [ ] Moving base: noise in room DAgger. `noisy_copy` only handles 1 scan, so 3 scans need that fixed first
 
 ## 5. Demo and repo
-- [ ] Rehearse the lab demo on the laptop that will be used (clone, RoboEnv, torch, demo.py)
-- [ ] Final push: code, weights, README updated for whatever is added above. Not on GitHub yet: demo.py adversity
-      options, DEMO.md, CHECKLIST.md, ROADMAP.md, robust_full.py, efficiency.py, eval_arm.py perturb, val_e and hard3 scenarios
+- [ ] Rehearse the lab demo on the laptop that will be used (clone, RoboEnv, torch, comp0245/apps/demo.py)
+- [ ] Final push: code, weights, README updated for whatever is added above. Not on GitHub yet: comp0245/apps/demo.py adversity
+      options, DEMO.md, CHECKLIST.md, ROADMAP.md, comp0245/evaluation/robust_full.py, comp0245/evaluation/efficiency.py, comp0245/evaluation/eval_arm.py perturb, val_e and hard3 scenarios
 - [ ] README: external sources, and which parts were modified or written from scratch (the brief requires this)
 
 ## 6. Report (max 6 pages, IEEE LaTeX) + contribution statement (max 1 page)

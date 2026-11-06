@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "comp0245"
+version = "0.1.0"
+description = "Imitation learning for a mobile manipulator: expert data, learned base and arm policies, DAgger and evaluation (UCL COMP0245)."
+readme = "README.md"
+requires-python = ">=3.10"
+# The simulator stack (PyBullet, Pinocchio, simulation_and_control) comes from the course RoboEnv
+# environment, not from PyPI; see README.md and docs/dependencies.md.
+dependencies = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "joblib",
+    "matplotlib",
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = ["ruff"]
+
+[tool.setuptools.packages.find]
+include = ["comp0245*"]
+
+[tool.setuptools.package-data]
+"comp0245.apps" = ["templates/*.html"]
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"
+extend-exclude = ["experiments", "runs", "runsJ", "report"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # import sorting
+    "N",   # pep8 naming
+    "UP",  # modern syntax for the target Python
+    "B",   # likely bugs
+]
+ignore = [
+    "N803", "N806",  # single-letter maths names (X, Y, K) follow the papers and course notes
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Helper functions defined inside sampling loops are only called in the same iteration.
+"comp0245/scenarios/make_*_scenarios.py" = ["B023"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["comp0245", "tests"]

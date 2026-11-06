@@ -36,7 +36,7 @@ Quick reference, newest thinking only. The reasons are in AGENT_LOG.md.
 | Merged | Julia's 00984f1 is in this folder. Her 19237ea is not, and her `settings.json` must not be taken. Nothing is on GitHub `main` yet | Merge her DAgger code; pushing needs Akhilesh's yes |
 | Test split | Runs once, after the freeze | Wed night |
 | Combined room model (6 Nov) | One model for our rooms + Julia's: 0.8 m/s window teacher, lidar 144 rays / 10 m, no A* at run time, 3 DAgger rounds, recipe unchanged (Akhilesh: "keep it as is"). Rule: ours >= 35 parked with <= 13 mover hits AND hers >= current + 10. Disk filled at 01:51; resumed 07:31 | Result ~13:30-14:30 |
-| GPU rerun, batch 1024 (6 Nov) | After the combined run, the same DAgger on the same teacher data with training on the GPU (rocm-test venv, used as is) at batch 1024, while Akhilesh writes the report | Build after the combined run ends (no edits to dagger.py / train_base_torch.py mid-run) |
+| GPU rerun, batch 1024 (6 Nov) | After the combined run, the same DAgger on the same teacher data with training on the GPU (rocm-test venv, used as is) at batch 1024, while Akhilesh writes the report | Build after the combined run ends (no edits to comp0245/training/dagger.py / comp0245/training/train_base_torch.py mid-run) |
 
 ## The fixed dates
 - **Fri 6 Nov:** report, contribution statement and code due. (Julia's notes say "about 8 Nov". The brief says 6 Nov:
@@ -87,7 +87,7 @@ does what**, because her Phase 4 is this same work.
 This answers the brief's "single instant vs temporal interval" on a task where the answer should matter.
 1. **Visible-only expert.** A mover counts only if a lidar ray hit it in the last 1 s, with constant-velocity prediction
    and no turning points. Walls, furniture and static cylinders stay known. **Passed 2 Nov and is now the teacher:** 117/120 against
-   119/120 for the full expert on the same scenarios, gate 90% (`compare_experts.py`). In the mixed-size rooms it scores
+   119/120 for the full expert on the same scenarios, gate 90% (`comp0245/evaluation/compare_experts.py`). In the mixed-size rooms it scores
    lower: 183/200 and 54/60 (see step 3).
 2. **Done 2 Nov.** Train, validation and test sets with movers, in **rooms of mixed size** (7 to 14 m wide, each layout
    moved to a random place in its room): `scenarios_rooms_{train,val,test}.json`. 200, 60 and 80 scenarios, half moving
@@ -110,7 +110,7 @@ This answers the brief's "single instant vs temporal interval" on a task where t
    worse" again. All 60 runs moved, so this is not the standstill copycat. The final base parks about 4 times closer with
    only 1 scan, which points at DAgger and data, not scans, as the larger gap; it was also trained on more data, so this is
    a pointer and not proof. Every model above hits movers in most runs. 1 vs 3 scans must be repeated with DAgger.
-5. **Done 3 Nov: threat prediction and a learned ray filter** (`train_base_torch.py --threat --encoder conv`).
+5. **Done 3 Nov: threat prediction and a learned ray filter** (`comp0245/training/train_base_torch.py --threat --encoder conv`).
    Threat: a training-only output (will a mover come within 1 m of the robot in the next 3 s; its position and velocity
    in the robot's directions), from the simulator's true positions, ignored while driving. Ray filter: one small set of
    weights looks at 5 neighbouring rays in all 3 scans and slides round all 36 positions; results stay in order, so
@@ -120,7 +120,7 @@ This answers the brief's "single instant vs temporal interval" on a task where t
 6. **DAgger with a shadow expert, with noise on the model's inputs only.** Her notes say DAgger cannot use the RRT expert
    yet, because its clock and plan are not updated while the network drives. That is the same problem we solved for the
    arm: keep a shadow expert running beside the policy. It already replans when it strays 0.3 m from its plan, so this
-   looks like a small change. **Done 3 Nov, no noise yet** (`runs/dagger-rooms.sh`, `dagger.py --label-expert rrt_visible`):
+   looks like a small change. **Done 3 Nov, no noise yet** (`runs/dagger-rooms.sh`, `comp0245/training/dagger.py --label-expert rrt_visible`):
    the visible-only expert replans beside the model and labels every state; a labelling run stops after 2 s touching
    something or 20 s standing still. 3 rounds x 100 runs on the 200 training rooms, 2 x 64, arm held, scored by driving
    the 60 room validation scenarios, 1 seed. Strict / loose / no contact / mover contact per round r0 -> r3:
@@ -186,14 +186,14 @@ reasons ready for the methodology section.
 - Test sets are generated before the freeze, for the open floor and each kept environment. Each runs once.
 - The moving model is a second model, so the open-floor model needs no swap test. If it were ever to replace it, it
   would have to pass `val_e` and `hard3` first.
-- Rerun `robust_full.py` on the final open-floor robot (22 min) if model B replaces the arm.
+- Rerun `comp0245/evaluation/robust_full.py` on the final open-floor robot (22 min) if model B replaces the arm.
 - Report the expert beside the learned robot, failures included.
 - Expert results need their scenario sets in the repo, or they cannot be reproduced.
 
 ## Do first, whatever else changes
 1. **Roles:** Akhilesh and Julia agree who owns Phase 4, so it is not built twice.
 2. **Lab demo:** attend the earliest session you can, with the current system.
-3. **Laptop:** check RoboEnv, torch and `demo.py` run on it, soon.
+3. **Laptop:** check RoboEnv, torch and `comp0245/apps/demo.py` run on it, soon.
 4. **Speedups:** skip the unused mass matrix and use 10-12 workers. Ten workers ran fine today.
 5. **README:** external sources, and which parts were modified or written from scratch. `--rrt`, `--room` and floor
    plans are not documented yet.

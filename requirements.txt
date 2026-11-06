@@ -1,3 +1,4 @@
+# Package metadata and tool settings are in pyproject.toml; this file lists the same extra packages.
 # Additional baseline ML packages; install inside the course RoboEnv environment.
 # Simulator dependencies (Pinocchio, PyBullet, simulation_and_control, etc.)
 # must be installed following RoboEnv, not via a similarly named PyPI package.

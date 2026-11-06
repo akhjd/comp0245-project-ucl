@@ -67,7 +67,7 @@ the expert needs a reference; the usual approximation is to restart it at `q_des
 approximation and would be stated as such.
 
 ## Effort
-About half a day: data extraction (1 h), training script reuse (train_base_torch.py pattern, 1 h), arm policy
+About half a day: data extraction (1 h), training script reuse (comp0245/training/train_base_torch.py pattern, 1 h), arm policy
 in the evaluation (1-2 h), runs and analysis (1-2 h). Akhilesh could write the training part, guided, as before.
 
 ## Decisions for Akhilesh

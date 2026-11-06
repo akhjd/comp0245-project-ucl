@@ -6,6 +6,10 @@ logged in `docs/DATASETS.md` and `docs/ROADMAP.md`. Most scripts hardcode the pr
 (`/home/akhjd/ros2_ws/comp0245_project`) and expect to run from inside `runs/`, so read them as a record of what
 was run rather than as ready-to-run tools.
 
+They were written before the code moved into the `comp0245` package (commit `7f585a3`): they import flat modules
+(`import eval_obstacles`) and read `settings.json` and `scenarios_*.json` from the project root. To rerun one, check
+out `7f585a3`, or change its imports to `from comp0245.<sub> import <module>` (see the layout in the main README).
+
 - `overnight-combined/`: the 6 Nov combined room model (our rooms + Julia's floor plans, 0.8 m/s window teacher,
   144-ray 10 m lidar, DAgger).
 - `crossing/`, `scans-rooms/`, `modes-gate/`: room-model experiments (crossing movers, scan history, output types).

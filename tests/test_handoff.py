@@ -1,15 +1,19 @@
-"""Tests for the arm hand-off in eval_arm.LearnedArm (5 Nov): the arm waits for the full parking rule, and a folded
-arm unfolds to the normal start pose before the learned arm takes over."""
+"""Tests for the arm hand-off in eval_arm.LearnedArm (5 Nov): the arm waits for the full parking
+rule, and a folded arm unfolds to the normal start pose before the learned arm takes over."""
+
 import unittest
+
 import numpy as np
-from eval_arm import LearnedArm, ARM_START, UNFOLD_RATE
-from eval_obstacles import ARM_FOLD, SETTLE_WINDOW_S, reach_limit
+
+from comp0245.evaluation.eval_arm import ARM_START, UNFOLD_RATE, LearnedArm
+from comp0245.evaluation.eval_obstacles import ARM_FOLD, SETTLE_WINDOW_S, reach_limit
 
 TARGET = [2.0, 0.0, 0.58]
 
 
 class StillBase:
     """A learned base stand-in (no "arrived"): always commands zero wheels."""
+
     def act(self, state):
         return np.zeros(11)
 
@@ -36,10 +40,10 @@ def steps_until_parked(policy, s, limit=6000):
 
 class HandoffTests(unittest.TestCase):
     def test_waits_for_the_whole_window(self):
-        inside = [TARGET[0] - 0.9*reach_limit(TARGET[2], 0.0), 0.0]
+        inside = [TARGET[0] - 0.9 * reach_limit(TARGET[2], 0.0), 0.0]
         k = steps_until_parked(arm(), state(inside))
         # 2 s of time before counting starts, then the full settle window
-        self.assertAlmostEqual(k*0.001, 2.0 + SETTLE_WINDOW_S, delta=0.01)
+        self.assertAlmostEqual(k * 0.001, 2.0 + SETTLE_WINDOW_S, delta=0.01)
 
     def test_refuses_outside_the_reach_area(self):
         too_far = [TARGET[0] - reach_limit(TARGET[2], 0.0) - 0.05, 0.0]
@@ -57,8 +61,8 @@ class HandoffTests(unittest.TestCase):
         while policy.unfolding(np.zeros(7)):
             k += 1
         np.testing.assert_allclose(policy.q_hold, ARM_START, atol=1e-9)
-        slowest = np.abs(np.array(ARM_START) - ARM_FOLD).max()/UNFOLD_RATE
-        self.assertAlmostEqual(k*0.001, slowest, delta=0.01)
+        slowest = np.abs(np.array(ARM_START) - ARM_FOLD).max() / UNFOLD_RATE
+        self.assertAlmostEqual(k * 0.001, slowest, delta=0.01)
         # the learned arm waits while the joints are still moving
         self.assertTrue(policy.unfolding(np.full(7, 0.1)))
 

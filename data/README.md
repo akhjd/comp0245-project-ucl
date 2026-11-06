@@ -1,6 +1,7 @@
 # Data
 
-No data are bundled. Generate expert episodes with the README collection command, or obtain an agreed dataset from your group. Existing local datasets may live under /data/comp0245/runs on the original workstation; this repository intentionally does not follow those symlinks.
+`scenarios/` holds the scenario files (start, targets, obstacles, split) used by the commands; they are small
+and kept in Git. No episode data are bundled. Generate expert episodes with the README collection command, or obtain an agreed dataset from your group. Existing local datasets may live under /data/comp0245/runs on the original workstation; this repository intentionally does not follow those symlinks.
 
 Preserve the manifest, scenario IDs, seeds, units, observation/action ordering, simulator settings and source hashes. Check expert completion and inspect failed episodes before training. Keep entire trajectories and related scenario families within one split; fit normalisation using training data only. Do not randomly split neighbouring time steps across train and evaluation.
 

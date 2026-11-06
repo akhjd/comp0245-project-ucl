@@ -6,6 +6,32 @@ A small, interchangeable behaviour-cloning pipeline for the COMP0245 Robotnik mo
 
 The existing cloned dependencies are siblings: `../RoboEnv` holds `pixi.toml`, `pixi.lock`, the installed environment and simulator assets; `../LAB_SESSION_COMP_0245_2026_PUBLIC` holds the supplied expert. This project owns the training/evaluation code and runs. It currently reuses RoboEnv’s environment; an independent environment for sharing is a separate portability step.
 
+## Project layout
+
+```text
+comp0245/               the Python package (run modules with `python -m comp0245.<sub>.<module>`)
+  paths.py              fixed repository locations (ROOT, config, scenarios, weights, runs)
+  models.py             observation/action names, input features, model registry
+  pipeline.py           collect / train / evaluate CLI for the baseline models (used by run.sh)
+  arm_data.py           arm physics (gravity torque, IK direction) and arm-phase rows
+  sim/                  simulator wrappers: robot, obstacles, lidar, expert controllers
+  scenarios/            scenario generators and previews
+  training/             expert data collection, behaviour cloning, DAgger (base and arm)
+  evaluation/           closed-loop evaluation, robustness tests, comparisons
+  apps/                 demos and run viewers (HTML templates in apps/templates/)
+config/settings.json    simulator paths, control and success settings, baseline hyperparameters
+data/scenarios/         scenario files (*.json); a bare file name on the command line is found here
+weights/                final model weights (see weights/README.md)
+tests/                  unit tests
+experiments/            one-off launch scripts kept as a record (written for the old flat layout)
+docs/, report/          notes and the report draft
+runs/                   outputs (not in Git)
+```
+
+Run every command from the repository root, for example
+`python -m comp0245.apps.demo full`. Scenario files can be given by bare name
+(`--file scenarios_obstacles_val_e.json`): paths are tried as given, then under `data/scenarios/`.
+
 ## Start here
 
 Open a terminal in this folder. Run commands with `bash run.sh`. The launcher uses the installed RoboEnv Python and keeps plots/caches inside `runs/`.
@@ -48,13 +74,13 @@ Existing run directories are never overwritten. Use a new versioned name for eac
 
 | File | Purpose |
 |---|---|
-| `settings.json` | External repository paths, control frequency, history length, success threshold, model hyperparameters |
-| `scenarios.json` | Fixed target coordinates, IDs, seeds, and whole-episode split assignments |
-| `models.py` | Observation/action names, causal history, preprocessing and model registry |
-| `robot_env.py` | Simulator adapter, expert integration and episode metrics |
-| `pipeline.py` | Collection, training, evaluation and run manifests |
+| `config/settings.json` | External repository paths, control frequency, history length, success threshold, model hyperparameters |
+| `data/scenarios/scenarios.json` | Fixed target coordinates, IDs, seeds, and whole-episode split assignments |
+| `comp0245/models.py` | Observation/action names, causal history, preprocessing and model registry |
+| `comp0245/sim/robot_env.py` | Simulator adapter, expert integration and episode metrics |
+| `comp0245/pipeline.py` | Collection, training, evaluation and run manifests |
 
-To use a different machine, update repository paths in `settings.json` and set `ROBOENV_PYTHON` to that machine's working environment interpreter. The launcher defaults to the existing Linux installation; Windows/macOS launchers have not been tested. Python execution also works directly from a properly activated RoboEnv environment.
+To use a different machine, update repository paths in `config/settings.json` and set `ROBOENV_PYTHON` to that machine's working environment interpreter. The launcher defaults to the existing Linux installation; Windows/macOS launchers have not been tested. Python execution also works directly from a properly activated RoboEnv environment.
 
 ## The shared model interface
 
@@ -98,11 +124,22 @@ A good offline prediction error does not imply successful closed-loop control. D
 ## Checks and learning route
 
 ```bash
-# From a RoboEnv terminal, or using its Python directly:
-python -B -m unittest discover -s tests -v
+# From a RoboEnv terminal, or using its Python directly, in the repository root:
+python -B -m unittest discover -s tests -t . -v
 ```
 
-Suggested walkthrough: inspect one observation/action row in `models.py`; follow one simulator step in `robot_env.py`; inspect `training.json`; then compare its offline errors with the validation rollout. Change one hyperparameter at a time and keep separate output folders.
+Code style follows PEP 8, enforced with [ruff](https://docs.astral.sh/ruff/) (settings in `pyproject.toml`:
+line length 99, import sorting, pyflakes, naming and bug checks). Before committing:
+
+```bash
+ruff format .
+ruff check .
+```
+
+`ruff` can be run without installing it via `uvx ruff ...`. `pip install -e ".[dev]"` installs the package and
+ruff, but is not needed: running from the repository root is enough.
+
+Suggested walkthrough: inspect one observation/action row in `comp0245/models.py`; follow one simulator step in `comp0245/sim/robot_env.py`; inspect `training.json`; then compare its offline errors with the validation rollout. Change one hyperparameter at a time and keep separate output folders.
 
 Your next significant work can be a target-relative feature encoder or a dataset-import adapter. Those are focused, understandable additions you can write yourself and merge with teammates. This folder can become your team's Git repository after agreeing its location and attribution. Nothing is pushed or published automatically.
 
