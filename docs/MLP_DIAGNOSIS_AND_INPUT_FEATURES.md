@@ -159,7 +159,7 @@ Velocity stays in the main model unless these results justify dropping it, becau
 
 ## Other experiments and suggested order
 
-Input noise and left-right mirroring are in `train_mlp.py` as `mlp2`. The mirror passed its simulator checks. They mainly target generalisation, which is not clearly the problem, and they cannot add the missing standstill examples, so they may not change driving much. The `mlp2` run is optional.
+Input noise and left-right mirroring are in `comp0245/training/train_mlp.py` as `mlp2`. The mirror passed its simulator checks. They mainly target generalisation, which is not clearly the problem, and they cannot add the missing standstill examples, so they may not change driving much. The `mlp2` run is optional.
 
 1. Add the new features and a velocity option, including a case 1 filter.
 2. Run models A, B and C on case 1.

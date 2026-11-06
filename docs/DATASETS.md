@@ -17,7 +17,7 @@ grip 0.1 (course: 0.01) and reach-zone parking, unless stated.
 | `scenarios_obstacles_v4_height.json` | 200 train | `trainh_` | arm data: wider target heights only | **0.2-1.1 m** | 1-3 | standard |
 | `scenarios_obstacles_v4_armstart.json` | 200 train | `traina_` | arm data: random arm start pose only | 0.35-0.8 m | 1-3 | **+-0.3 rad per joint** |
 | `scenarios_obstacles_v4_both.json` | 200 train | `trainha_` | arm data: both changes | **0.2-1.1 m** | 1-3 | **+-0.3 rad** |
-| `scenarios_obstacles_hard2_train.json` | 108 train | `trainhard2_` | hard layouts on purpose (`make_obstacle_scenarios.py --hard`): walls, 2-3 blockers, gaps down to 1 m, crowded parking spot; expert-solved only | 0.35-0.8 m | 2-6 | standard |
+| `scenarios_obstacles_hard2_train.json` | 108 train | `trainhard2_` | hard layouts on purpose (`comp0245/scenarios/make_obstacle_scenarios.py --hard`): walls, 2-3 blockers, gaps down to 1 m, crowded parking spot; expert-solved only | 0.35-0.8 m | 2-6 | standard |
 | `scenarios_obstacles_hard2_select.json` | 20 validation | `validationhard2s_` | same generator; used only to choose the DAgger round | 0.35-0.8 m | 2-5 | standard |
 | `scenarios_obstacles_hard2_gate.json` | 30 validation | `validationhard2g_` | same generator; used only for the swap test | 0.35-0.8 m | 2-5 | standard |
 
@@ -45,14 +45,14 @@ Standard arm start pose = the course's [0, 1.57, 0, 1, 0, 1, 0] rad.
 | `obst-hard2-train-a/-b`, `obst-hard2-select`, `obst-hard2-gate` | expert drives on the hard-layout candidates (only solved ones are used) |
 | `robust-gate-normal`, `robust-gate-oldhard`, `robust-gate-newhard` | swap test: novnoise r2 vs novnoise-hard r3 |
 | `robust-hard-r3` | full robustness suite on the final base model (29 Oct afternoon) |
-| `arm-a` | arm model A (train_arm.py, 24 inputs, gravity + network), trained by Akhilesh on the three obst-v4 sets |
-| `arm-eval-arm-a`, `arm-eval-expert` | closed-loop arm test (eval_arm.py): expert wheels + learned arm, and the full-task expert on the same scenarios |
+| `arm-a` | arm model A (comp0245/training/train_arm.py, 24 inputs, gravity + network), trained by Akhilesh on the three obst-v4 sets |
+| `arm-eval-arm-a`, `arm-eval-expert` | closed-loop arm test (comp0245/evaluation/eval_arm.py): expert wheels + learned arm, and the full-task expert on the same scenarios |
 | `robust-base-r2`, `robust-noise-r2` | overnight: robustness tests (results.json has the tables) |
 | `robust-fix-expert` | 29 Oct: the like-for-like expert reference (`expert_hold`: expert wheels, same fixed arm hold and 40 s as the learned models) on every test |
 | `robust-fix-delay` | 29 Oct: delay tests rerun for the four round-2 models after the delay warm-up fix (supersedes the delay rows of the two overnight runs) |
 
 Scoring: evaluations scored before 29 Oct have their original `results.json` / `evaluation.json` plus a
-`rescored.json` from `rescore.py` (parking must hold for the last 2 s, base stopped, including yaw rate). Use
+`rescored.json` from `comp0245/evaluation/rescore.py` (parking must hold for the last 2 s, base stopped, including yaw rate). Use
 `rescored.json`. The `expert` rows in `robust-base-r2` are the full-task expert (arm reaches, episode ends early):
 not a like-for-like reference; use `robust-fix-expert`.
 

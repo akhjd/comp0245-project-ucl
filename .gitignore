@@ -26,3 +26,6 @@ data/*
 *.blg
 *.out
 *.synctex.gz
+
+# scenario files are small and kept in Git
+!data/scenarios/

@@ -8,7 +8,7 @@ folder="$1"; jobs="${2:-7}"
 for case in case1 case2 case3 case4 case5; do
   start=$(date +%s)
   for ((j = 0; j < jobs; j++)); do
-    python collect_obstacles.py --scenarios "$folder/$case.part$j.json" --out "$folder/$case/part$j" --rrt --duration 120 \
+    python -m comp0245.training.collect_obstacles --scenarios "$folder/$case.part$j.json" --out "$folder/$case/part$j" --rrt --duration 120 \
       --save-every 10 --resume --only-clean >> "$folder/$case.part$j.log" 2>&1 &
   done
   wait

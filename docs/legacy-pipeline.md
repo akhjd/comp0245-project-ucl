@@ -50,9 +50,9 @@ Existing run directories are never overwritten. Use a new versioned name for eac
 |---|---|
 | `settings.json` | External repository paths, control frequency, history length, success threshold, model hyperparameters |
 | `scenarios.json` | Fixed target coordinates, IDs, seeds, and whole-episode split assignments |
-| `models.py` | Observation/action names, causal history, preprocessing and model registry |
-| `robot_env.py` | Simulator adapter, expert integration and episode metrics |
-| `pipeline.py` | Collection, training, evaluation and run manifests |
+| `comp0245/models.py` | Observation/action names, causal history, preprocessing and model registry |
+| `comp0245/sim/robot_env.py` | Simulator adapter, expert integration and episode metrics |
+| `comp0245/pipeline.py` | Collection, training, evaluation and run manifests |
 
 To use a different machine, update repository paths in `settings.json` and set `ROBOENV_PYTHON` to that machine's working environment interpreter. The launcher defaults to the existing Linux installation; Windows/macOS launchers have not been tested. Python execution also works directly from a properly activated RoboEnv environment.
 
@@ -102,7 +102,7 @@ A good offline prediction error does not imply successful closed-loop control. D
 python -B -m unittest discover -s tests -v
 ```
 
-Suggested walkthrough: inspect one observation/action row in `models.py`; follow one simulator step in `robot_env.py`; inspect `training.json`; then compare its offline errors with the validation rollout. Change one hyperparameter at a time and keep separate output folders.
+Suggested walkthrough: inspect one observation/action row in `comp0245/models.py`; follow one simulator step in `comp0245/sim/robot_env.py`; inspect `training.json`; then compare its offline errors with the validation rollout. Change one hyperparameter at a time and keep separate output folders.
 
 Your next significant work can be a target-relative feature encoder or a dataset-import adapter. Those are focused, understandable additions you can write yourself and merge with teammates. This folder can become your team's Git repository after agreeing its location and attribution. Nothing is pushed or published automatically.
 
