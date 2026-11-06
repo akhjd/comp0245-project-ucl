@@ -36,7 +36,7 @@ Quick reference, newest thinking only. The reasons are in AGENT_LOG.md.
 | Merged | Julia's 00984f1 is in this folder. Her 19237ea is not, and her `settings.json` must not be taken. Nothing is on GitHub `main` yet | Merge her DAgger code; pushing needs Akhilesh's yes |
 | Test split | Runs once, after the freeze | Wed night |
 | Combined room model (6 Nov) | One model for our rooms + Julia's: 0.8 m/s window teacher, lidar 144 rays / 10 m, no A* at run time, 3 DAgger rounds, recipe unchanged (Akhilesh: "keep it as is"). Rule: ours >= 35 parked with <= 13 mover hits AND hers >= current + 10. Disk filled at 01:51; resumed 07:31. **Result 13:36: ours 39/60 parked, 15 mover hits; Julia's 34/60 (current 19). Fails on mover hits (15 > 13). Round 2 checked too: ours 34/60, 22 hits; Julia's 34. Current model stays** | GPU rerun without doorways next |
-| GPU rerun, batch 1024 (6 Nov) | After the combined run, the same DAgger on the same teacher data with training on the GPU (rocm-test venv, used as is) at batch 1024, while Akhilesh writes the report | Build after the combined run ends (no edits to dagger.py / train_base_torch.py mid-run) |
+| GPU rerun, batch 1024 (6 Nov) | After the combined run, the same DAgger on the same teacher data with training on the GPU (rocm-test venv, used as is) at batch 1024, while Akhilesh writes the report | Build after the combined run ends (no edits to comp0245/training/dagger.py / comp0245/training/train_base_torch.py mid-run) |
 
 ## The fixed dates
 - **Fri 6 Nov:** report, contribution statement and code due. (Julia's notes say "about 8 Nov". The brief says 6 Nov:
