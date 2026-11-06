@@ -1,5 +1,16 @@
 # Robot learning pipeline
 
+## Two models, two branches
+
+The report compares two separate models. They are kept apart on purpose and are not merged:
+
+| Model | Branch | Expert (teacher) | Student |
+|---|---|---|---|
+| **Model A** (RRT and A*) | [`rrt-expert`](../../tree/rrt-expert) | time-aware RRT planner, guided through floor-plan doorways by an A* route | MLP on 61 hand-made lidar features (walls, openings, blocked line to the target), trained by behaviour cloning + DAgger |
+| **Model B** (dynamic window) | `main` (this branch) | deterministic dynamic-window controller | MLP with a learned ray filter over 3 raw lidar scans, threat head and hold output, trained by behaviour cloning + DAgger |
+
+To work on Model A: `git checkout rrt-expert` (see that branch's README for its commands).
+
 **Working location on this PC:** `/home/akhjd/ros2_ws/comp0245_project`. Open a terminal here for ongoing work. The earlier Documents/Codex copy is a bootstrap snapshot.
 
 A small, interchangeable behaviour-cloning pipeline for the COMP0245 Robotnik mobile manipulator. It uses your existing RoboEnv Pixi environment and the course expert controller. No packages are installed and no external repositories are edited.
